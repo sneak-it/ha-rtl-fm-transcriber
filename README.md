@@ -2,6 +2,8 @@
 
 Home Assistant add-on that captures FM radio via RTL-SDR, transcribes with Whisper, and publishes to MQTT.
 
+Optimized for emergency services (public safety) radio monitoring on VHF (150-174 MHz) and UHF (421-512 MHz) bands using narrowband FM (12.5 kHz channels).
+
 ## Installation
 
 1. Copy this folder to your Home Assistant's `/addons/` directory
@@ -14,8 +16,8 @@ Home Assistant add-on that captures FM radio via RTL-SDR, transcribes with Whisp
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `frequency` | FM frequency in MHz | 155.1075 |
-| `squelch` | Noise threshold (0-100) | 50 |
+| `frequency` | FM frequency in MHz (e.g. 155.1075) | 155.1075 |
+| `squelch` | Noise threshold (0-200, higher = more selective) | 50 |
 | `chunk_duration` | Audio chunk length in seconds | 15 |
 | `whisper_url` | Wyoming server URL (e.g. `tcp://host:10300`) | http://10.0.10.21:10300 |
 | `mqtt_host` | MQTT broker hostname | core-mosquitto |
@@ -23,6 +25,20 @@ Home Assistant add-on that captures FM radio via RTL-SDR, transcribes with Whisp
 | `mqtt_topic` | Topic for transcriptions | radio/transcription |
 | `mqtt_username` | MQTT username (optional) | |
 | `mqtt_password` | MQTT password (optional) | |
+| `vad_threshold` | RMS amplitude threshold for voice detection | 0.01 |
+| `gain` | RTL-SDR gain (number or "auto") | auto |
+| `ppm` | PPM correction for RTL-SDR clock drift (0-500) | 0 |
+| `bandpass_filter` | Enable voice bandpass filter (300-3000 Hz) | true |
+| `bandpass_low` | Bandpass filter low cutoff in Hz | 300 |
+| `bandpass_high` | Bandpass filter high cutoff in Hz | 3000 |
+| `debug_audio` | Save debug audio to /config/www/ | false |
+
+### rtl_fm Parameters Explained
+
+- **squelch**: Controls the noise threshold. Higher values require stronger signals to open the squelch. For public safety monitoring, start at 50 and adjust based on your environment (range 0-200).
+- **gain**: Use manual gain values for best results. Run `rtl_test` to find optimal gain for your dongle. Set to "auto" for automatic gain control.
+- **ppm**: RTL-SDR dongles have slight clock drift. Run `rtl_test -p` to measure your dongle's PPM offset and enter it here for accurate frequency tuning.
+- **bandpass_filter**: Removes low-frequency hum (below 300 Hz) and high-frequency static (above 3000 Hz) to improve transcription quality. This is recommended for emergency services monitoring.
 
 ## MQTT Output
 

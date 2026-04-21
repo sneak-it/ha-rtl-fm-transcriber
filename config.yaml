@@ -1,5 +1,5 @@
 name: "RTL-FM Transcriber"
-version: "1.2.2"
+version: "1.3.0"
 slug: rtl-fm-transcriber
 description: "Captures FM radio via RTL-SDR, transcribes with Whisper, publishes to MQTT"
 init: false
@@ -29,9 +29,13 @@ options:
   vad_threshold: 0.01
   gain: "auto"
   debug_audio: false
+  ppm: 0
+  bandpass_filter: true
+  bandpass_low: 300
+  bandpass_high: 3000
 schema:
   frequency: float
-  squelch: int(0,1000)
+  squelch: int(0,200)
   chunk_duration: int(5,60)
   whisper_url: url
   mqtt_host: str
@@ -42,3 +46,7 @@ schema:
   vad_threshold: float
   gain: str?
   debug_audio: bool
+  ppm: int(0,500)
+  bandpass_filter: bool
+  bandpass_low: int(100,5000)
+  bandpass_high: int(1000,12000)

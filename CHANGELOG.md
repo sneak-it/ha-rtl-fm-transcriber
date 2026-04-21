@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.3.0
+
+- **Critical fix**: Changed rtl_fm sample rate from 48000 Hz to 12000 Hz for narrowband FM (public safety radio)
+- Added `-E dc` to rtl_fm command for DC offset removal (reduces low-frequency hum)
+- Added PPM correction support (`ppm` option) for RTL-SDR dongle clock drift calibration
+- Added optional voice bandpass filter (300-3000 Hz default) to improve transcription quality
+  - `bandpass_filter`: Enable/disable the filter (default: true)
+  - `bandpass_low`: Low cutoff frequency in Hz (default: 300)
+  - `bandpass_high`: High cutoff frequency in Hz (default: 3000)
+- Fixed squelch schema range from int(0,1000) to int(0,200) (correct rtl_fm range)
+- Improved VAD RMS parsing reliability using regex for cross-version sox compatibility
+- Added `ppm`, `bandpass_filter`, `bandpass_low`, `bandpass_high` to default configuration
+
 ## 1.2.2
 
 - Added `debug_audio` option. If enabled, saves `rtl_last_capture.wav` to `/config/www/` for debugging signal quality.

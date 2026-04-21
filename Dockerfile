@@ -7,7 +7,6 @@ RUN apk add --no-cache \
     sox \
     python3 \
     py3-pip \
-    py3-pip \
     py3-requests \
     && pip3 install --no-cache-dir --break-system-packages paho-mqtt wyoming
 
