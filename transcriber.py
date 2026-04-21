@@ -50,7 +50,9 @@ def load_config():
         "mqtt_topic": "radio/transcription",
         "mqtt_username": "",
         "mqtt_password": "",
+        "vad_mode": "standard",
         "vad_threshold": 0.01,
+        "vad_baseline_window": 30,
         "gain": "auto",
         "debug_audio": False,
         "ppm": 0,
@@ -160,14 +162,90 @@ async def transcribe_wyoming(audio_path, whisper_url, connection_timeout=30):
     return None
 
 
-def check_audio_has_voice(wav_path, threshold=0.02):
+class _RmsBaselineTracker:
+    """Tracks RMS baseline for RTL-SDR VAD with inverted RMS behavior.
+    
+    In RTL-SDR setups with AGC, idle noise often has HIGHER RMS than
+    active transmissions (strong signal causes AGC to reduce gain).
+    This tracker maintains a rolling baseline of idle RMS values and
+    detects voice when RMS drops significantly below the baseline.
     """
-    Simple voice activity detection using audio amplitude.
-    Returns True if audio likely contains voice.
+    
+    def __init__(self, window_seconds=30):
+        """Initialize the baseline tracker.
+        
+        Args:
+            window_seconds: Seconds of idle samples to keep for baseline calculation.
+        """
+        self._samples = []
+        self._window_seconds = window_seconds
+        self._window_start_time = time.time()
+    
+    def add_sample(self, rms, timestamp=None):
+        """Add an RMS sample to the baseline.
+        
+        Args:
+            rms: The RMS amplitude value.
+            timestamp: Optional timestamp (defaults to current time).
+        """
+        ts = timestamp or time.time()
+        self._samples.append((ts, rms))
+        self._prune(ts)
+    
+    def _prune(self, current_time):
+        """Remove samples older than the window."""
+        cutoff = current_time - self._window_seconds
+        while self._samples and self._samples[0][0] < cutoff:
+            self._samples.pop(0)
+    
+    def get_baseline(self, current_time=None):
+        """Get the current baseline RMS value (median of idle samples).
+        
+        Args:
+            current_time: Optional timestamp (defaults to current time).
+            
+        Returns:
+            The median RMS value, or None if not enough samples.
+        """
+        if not self._samples:
+            return None
+        
+        current_time = current_time or time.time()
+        self._prune(current_time)
+        
+        if len(self._samples) < 3:
+            return None
+        
+        rms_values = [s[1] for s in self._samples]
+        rms_values.sort()
+        mid = len(rms_values) // 2
+        
+        if len(rms_values) % 2 == 0:
+            return (rms_values[mid - 1] + rms_values[mid]) / 2
+        return rms_values[mid]
+    
+    @property
+    def sample_count(self):
+        """Number of samples currently in the baseline."""
+        return len(self._samples)
+
+
+def check_audio_has_voice(wav_path, threshold=0.02, vad_mode="standard",
+                          baseline_tracker=None, baseline_window=30):
+    """
+    Voice activity detection using audio amplitude.
+    
+    Supports two modes:
+    - standard: Detects voice when RMS > threshold (normal audio recording)
+    - rtl_sdr: Detects voice when RMS drops below baseline - threshold
+               (RTL-SDR with AGC, where strong signals reduce gain)
 
     Args:
         wav_path: Path to WAV file to analyze
-        threshold: RMS amplitude threshold above which audio is considered to contain voice
+        threshold: RMS amplitude threshold for detection
+        vad_mode: Detection mode - "standard" or "rtl_sdr"
+        baseline_tracker: Optional _RmsBaselineTracker instance for rtl_sdr mode
+        baseline_window: Seconds of idle samples to keep for baseline (rtl_sdr mode)
 
     Returns:
         True if audio likely contains voice, False otherwise.
@@ -204,9 +282,14 @@ def check_audio_has_voice(wav_path, threshold=0.02):
                         rms = float(
                             numbers[-1]
                         )  # Take the last number (typically the RMS value)
-                        logger.info(f"Audio RMS: {rms} (Threshold: {threshold})")
                         rms_found = True
-                        return rms > threshold
+                        
+                        if vad_mode == "rtl_sdr":
+                            return _check_rtl_sdr_voice(rms, threshold,
+                                                        baseline_tracker, baseline_window)
+                        else:
+                            return _check_standard_voice(rms, threshold)
+                            
                     except ValueError:
                         logger.warning(
                             f"Could not parse RMS value from sox output: {line}"
@@ -232,6 +315,65 @@ def check_audio_has_voice(wav_path, threshold=0.02):
     except Exception as e:
         logger.warning(f"VAD check failed unexpectedly: {e}")
         return False
+
+
+def _check_standard_voice(rms, threshold):
+    """Standard VAD: voice detected when RMS > threshold.
+    
+    Used for normal audio recording (microphone input).
+    
+    Args:
+        rms: Measured RMS amplitude
+        threshold: RMS threshold above which audio is considered voice
+        
+    Returns:
+        True if RMS > threshold (voice detected).
+    """
+    logger.info(f"Audio RMS: {rms} (Threshold: {threshold})")
+    return rms > threshold
+
+
+def _check_rtl_sdr_voice(rms, threshold, baseline_tracker, baseline_window):
+    """RTL-SDR VAD: voice detected when RMS drops below baseline.
+    
+    In RTL-SDR setups with AGC, idle noise often has HIGHER RMS than
+    active transmissions. When a strong signal arrives, AGC reduces gain,
+    causing the RMS to drop.
+    
+    Args:
+        rms: Measured RMS amplitude
+        threshold: RMS drop margin below baseline for voice detection
+        baseline_tracker: _RmsBaselineTracker instance for tracking idle RMS
+        baseline_window: Seconds of idle samples to keep for baseline
+        
+    Returns:
+        True if RMS drops significantly below baseline (voice detected).
+    """
+    if baseline_tracker is None:
+        baseline_tracker = _RmsBaselineTracker(baseline_window)
+    
+    current_time = time.time()
+    baseline = baseline_tracker.get_baseline(current_time)
+    
+    if baseline is None or baseline_tracker.sample_count < 5:
+        # Not enough baseline data yet - collect samples
+        baseline_tracker.add_sample(rms, current_time)
+        logger.info(f"Audio RMS: {rms} (Baseline building: {baseline_tracker.sample_count} samples)")
+        # During baseline building, be conservative - only reject very low RMS
+        # This prevents transcribing silence while we gather baseline data
+        return rms < 0.005  # Near-silence threshold
+    
+    logger.info(f"Audio RMS: {rms} (Baseline: {baseline:.4f}, Threshold drop: {threshold})")
+    
+    # Voice detected when RMS drops below baseline by the threshold amount
+    voice_detected = rms < (baseline - threshold)
+    
+    # Only add to baseline if this sample is consistent with idle (noise)
+    # Don't add transmission samples to the baseline
+    if not voice_detected:
+        baseline_tracker.add_sample(rms, current_time)
+    
+    return voice_detected
 
 
 def is_hallucination(text):
@@ -464,6 +606,14 @@ async def capture_loop(config, mqtt_client):
 
     retry_count = 0
     stderr_reader_task = None
+    
+    # Create shared VAD baseline tracker for rtl_sdr mode
+    vad_mode = config.get("vad_mode", "standard")
+    vad_baseline_window = config.get("vad_baseline_window", 30)
+    baseline_tracker = None
+    if vad_mode == "rtl_sdr":
+        baseline_tracker = _RmsBaselineTracker(vad_baseline_window)
+        logger.info(f"RTL-SDR VAD mode enabled (baseline window: {vad_baseline_window}s)")
 
     while True:
         # Build pipeline
@@ -508,7 +658,9 @@ async def capture_loop(config, mqtt_client):
                             logger.info(
                                 f"Silence detected ({silence_timeout}s), processing transmission"
                             )
-                            await process_buffer(buffer, config, mqtt_client)
+                            await process_buffer(buffer, config, mqtt_client,
+                                                baseline_tracker=baseline_tracker,
+                                                vad_mode=vad_mode)
                             buffer = bytearray()
                     await asyncio.sleep(0.01)
                     continue
@@ -527,7 +679,9 @@ async def capture_loop(config, mqtt_client):
                 # If buffer gets too big (max duration), force process it
                 if len(buffer) > max_duration * bytes_per_sec:
                     logger.info("Max duration reached, forcing transcription")
-                    await process_buffer(buffer, config, mqtt_client)
+                    await process_buffer(buffer, config, mqtt_client,
+                                        baseline_tracker=baseline_tracker,
+                                        vad_mode=vad_mode)
                     buffer = bytearray()
 
                 # Check if processes still alive (asyncio.Process uses .returncode, not .poll())
@@ -603,8 +757,16 @@ async def capture_loop(config, mqtt_client):
         await asyncio.sleep(delay)
 
 
-async def process_buffer(audio_data, config, mqtt_client):
-    """Save buffer to WAV and transcribe."""
+async def process_buffer(audio_data, config, mqtt_client, baseline_tracker=None, vad_mode="standard"):
+    """Save buffer to WAV and transcribe.
+    
+    Args:
+        audio_data: Raw audio bytes to process
+        config: Configuration dictionary
+        mqtt_client: MQTT client instance
+        baseline_tracker: Optional _RmsBaselineTracker for rtl_sdr VAD mode
+        vad_mode: VAD detection mode ("standard" or "rtl_sdr")
+    """
     if len(audio_data) < 16000:  # Ignore tiny blips (<0.5s)
         return
 
@@ -646,7 +808,9 @@ async def process_buffer(audio_data, config, mqtt_client):
                 logger.debug(f"Failed to save debug audio (unexpected): {e}")
 
         # VAD Check
-        if not check_audio_has_voice(wav_path, config.get("vad_threshold", 0.05)):
+        vad_threshold = config.get("vad_threshold", 0.05)
+        if not check_audio_has_voice(wav_path, vad_threshold, vad_mode,
+                                     baseline_tracker, vad_baseline_window):
             os.unlink(wav_path)
             return
 
