@@ -348,15 +348,39 @@ async def _start_pipeline(config, frequency_hz, sample_rate, capture_rate):
             stderr=asyncio.subprocess.PIPE,
         )
 
-        # Pipe rtl_fm stdout into sox stdin
+        # Start sox with asyncio.PIPE stdin (not rtl_proc.stdout directly,
+        # because StreamReader has no fileno() for subprocess.Popen)
         sox_proc = await asyncio.create_subprocess_exec(
             *sox_cmd,
-            stdin=rtl_proc.stdout,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        # Close rtl_fm's stdout so it gets SIGPIPE if sox exits
-        rtl_proc.stdout.close()
+
+        # Background task: pipe rtl_fm stdout -> sox stdin asynchronously
+        async def _pipe_streams(reader, writer):
+            """Copy all data from reader to writer until EOF."""
+            try:
+                while True:
+                    chunk = await reader.read(65536)  # 64 KiB chunks
+                    if not chunk:
+                        break
+                    writer.write(chunk)
+                writer.close()
+                await writer.wait_closed()
+            except (asyncio.CancelledError, Exception):
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except (asyncio.InvalidStateError, RuntimeError):
+                    pass  # Already closed
+                raise
+
+        _pipe_task = asyncio.create_task(
+            _pipe_streams(rtl_proc.stdout, sox_proc.stdin)
+        )
+        # Store the task on the pipeline so it can be awaited during cleanup
+        sox_proc._pipe_task = _pipe_task  # noqa: SLF001
 
         return rtl_proc, sox_proc
     except (OSError, FileNotFoundError) as e:
@@ -388,7 +412,21 @@ async def _read_stderr_lines(proc, label):
 
 
 async def _cleanup_pipeline(rtl_proc, sox_proc):
-    """Safely terminate pipeline processes with specific exception handling."""
+    """Safely terminate pipeline processes with specific exception handling.
+
+    Waits for the async pipe task (rtl_fm -> sox) to finish before
+    terminating processes, ensuring sox receives EOF on stdin.
+    """
+    # First, wait for the async pipe task to finish so sox gets EOF on stdin.
+    pipe_task = getattr(sox_proc, "_pipe_task", None) if sox_proc else None
+    if pipe_task is not None and not pipe_task.done():
+        try:
+            await asyncio.wait_for(pipe_task, timeout=10.0)
+        except asyncio.TimeoutError:
+            logger.warning("Pipe task did not finish within timeout")
+        except Exception:
+            logger.debug("Pipe task finished with error (expected on stop)")
+
     # Stop sox first (it depends on rtl_fm)
     for name, proc in [("SOX", sox_proc), ("RTL_FM", rtl_proc)]:
         if proc is not None:
@@ -492,15 +530,15 @@ async def capture_loop(config, mqtt_client):
                     await process_buffer(buffer, config, mqtt_client)
                     buffer = bytearray()
 
-                # Check if processes still alive
-                if sox_proc.poll() is not None:
+                # Check if processes still alive (asyncio.Process uses .returncode, not .poll())
+                if sox_proc.returncode is not None:
                     logger.error(
                         f"Sox process exited unexpectedly (return code: {sox_proc.returncode})"
                     )
                     pipeline_running = False
                     break
 
-                if rtl_proc.poll() is not None:
+                if rtl_proc.returncode is not None:
                     logger.error(
                         f"RTL_FM process exited unexpectedly (return code: {rtl_proc.returncode})"
                     )
