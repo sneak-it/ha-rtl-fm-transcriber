@@ -34,6 +34,7 @@ options:
   bandpass_filter: true
   bandpass_low: 300
   bandpass_high: 3000
+  timezone: "UTC"
 schema:
   frequency: float
   squelch: int(0,200)
@@ -52,3 +53,4 @@ schema:
   bandpass_filter: bool
   bandpass_low: int(100,5000)
   bandpass_high: int(1000,12000)
+  timezone: str?

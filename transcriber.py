@@ -13,7 +13,7 @@ import re
 import subprocess
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -61,7 +61,58 @@ def load_config():
         "bandpass_filter": True,
         "bandpass_low": 300,
         "bandpass_high": 3000,
+        "timezone": "UTC",
     }
+
+
+def get_timezone_offset(tz_name: str) -> timedelta:
+    """Get the UTC offset for a given timezone name.
+    
+    This is a simplified lookup for common timezone names.
+    For full IANA timezone support, install the `tzdata` package.
+    
+    Args:
+        tz_name: IANA timezone name (e.g., 'America/New_York') or 'UTC'.
+        
+    Returns:
+        timedelta offset from UTC.
+    """
+    if tz_name == "UTC":
+        return timedelta(0)
+    
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import datetime
+        
+        # Use a representative date (current date may have different DST)
+        # We'll use a dynamic approach below for accuracy
+        tz = ZoneInfo(tz_name)
+        # Get offset for current moment by creating a naive UTC now and converting
+        now_utc = datetime.now(timezone.utc)
+        now_local = now_utc.astimezone(tz)
+        return now_local.utcoffset() or timedelta(0)
+    except ImportError:
+        logger.warning("zoneinfo not available, falling back to fixed offsets")
+    except Exception as e:
+        logger.warning(f"Could not load timezone '{tz_name}': {e}, using UTC")
+    
+    return timedelta(0)
+
+
+def format_timestamp(tz_name: str = "UTC") -> str:
+    """Generate an ISO-format timestamp in the specified timezone.
+    
+    Args:
+        tz_name: IANA timezone name (e.g., 'America/New_York') or 'UTC'.
+        
+    Returns:
+        ISO-format timestamp string with timezone offset.
+    """
+    now_utc = datetime.now(timezone.utc)
+    offset = get_timezone_offset(tz_name)
+    tz_info = timezone(offset, name=tz_name)
+    local_time = now_utc.astimezone(tz_info)
+    return local_time.isoformat()
 
 
 def create_mqtt_client(config):
@@ -891,7 +942,7 @@ async def process_buffer(audio_data, config, mqtt_client, baseline_tracker=None)
                 message = {
                     "text": clean_text,
                     "frequency": str(config["frequency"]),
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": format_timestamp(config.get("timezone", "UTC")),
                 }
                 mqtt_topic = config["mqtt_topic"]
                 mqtt_payload = json.dumps(message)

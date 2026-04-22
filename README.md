@@ -33,6 +33,7 @@ Optimized for emergency services (public safety) radio monitoring on VHF (150-17
 | `bandpass_low` | Bandpass filter low cutoff in Hz | 300 |
 | `bandpass_high` | Bandpass filter high cutoff in Hz | 3000 |
 | `debug_audio` | Save debug audio to /config/www/ | false |
+| `timezone` | Timezone for timestamps (IANA name) | America/New_York |
 
 ### rtl_fm Parameters Explained
 
