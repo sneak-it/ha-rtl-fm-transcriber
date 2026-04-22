@@ -25,9 +25,8 @@ Optimized for emergency services (public safety) radio monitoring on VHF (150-17
 | `mqtt_topic` | Topic for transcriptions | radio/transcription |
 | `mqtt_username` | MQTT username (optional) | |
 | `mqtt_password` | MQTT password (optional) | |
-| `vad_mode` | Voice detection mode: `standard` (RMS > threshold) or `rtl_sdr` (RMS drops below baseline for RTL-SDR with AGC) | standard |
 | `vad_threshold` | RMS amplitude threshold for voice detection | 0.01 |
-| `vad_baseline_window` | Seconds of idle audio to track for baseline (rtl_sdr mode only) | 30 |
+| `vad_baseline_window` | Seconds of idle audio to track for baseline | 30 |
 | `gain` | RTL-SDR gain (number or "auto") | auto |
 | `ppm` | PPM correction for RTL-SDR clock drift (0-500) | 0 |
 | `bandpass_filter` | Enable voice bandpass filter (300-3000 Hz) | true |
@@ -42,18 +41,14 @@ Optimized for emergency services (public safety) radio monitoring on VHF (150-17
 - **ppm**: RTL-SDR dongles have slight clock drift. Run `rtl_test -p` to measure your dongle's PPM offset and enter it here for accurate frequency tuning.
 - **bandpass_filter**: Removes low-frequency hum (below 300 Hz) and high-frequency static (above 3000 Hz) to improve transcription quality. This is recommended for emergency services monitoring.
 
-### Voice Activity Detection (VAD) Modes
+### Voice Activity Detection (VAD)
 
-The add-on supports two VAD modes to handle different audio characteristics:
+The add-on uses a baseline tracking algorithm to detect voice transmissions. In RTL-SDR setups with automatic gain control (AGC), idle noise often has a **higher** RMS amplitude than active transmissions. When a strong signal arrives, AGC reduces gain, causing the RMS to drop.
 
-- **standard**: Detects voice when RMS amplitude exceeds the threshold. This is the traditional approach for normal audio recording (microphone input).
-- **rtl_sdr**: Detects voice when RMS amplitude **drops below** the baseline minus threshold. This handles the inverted RMS behavior common in RTL-SDR setups with automatic gain control (AGC), where idle noise has higher RMS than active transmissions.
+The system automatically tracks a baseline of idle noise RMS values and detects transmissions when the signal drops significantly below that baseline.
 
-If you notice that your idle noise has a higher RMS value than actual transmissions (voice causes RMS to drop), use `rtl_sdr` mode. The mode automatically tracks a baseline of idle noise and detects transmissions when the signal drops significantly below that baseline.
-
-**Recommended settings for RTL-SDR with AGC:**
+**Recommended settings:**
 ```yaml
-vad_mode: "rtl_sdr"
 vad_threshold: 0.03
 vad_baseline_window: 30
 ```

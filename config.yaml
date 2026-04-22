@@ -26,7 +26,6 @@ options:
   mqtt_topic: "radio/transcription"
   mqtt_username: ""
   mqtt_password: ""
-  vad_mode: "standard"
   vad_threshold: 0.01
   vad_baseline_window: 30
   gain: "auto"
@@ -45,7 +44,6 @@ schema:
   mqtt_topic: str
   mqtt_username: str?
   mqtt_password: str?
-  vad_mode: "standard|rtl_sdr"
   vad_threshold: float
   vad_baseline_window: int(5,120)
   gain: str?
