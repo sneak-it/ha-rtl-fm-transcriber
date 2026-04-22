@@ -66,6 +66,7 @@ def load_config():
 
 def create_mqtt_client(config):
     """Create and connect MQTT client."""
+    logger.info("[MQTT] Initializing MQTT client...")
     client = mqtt.Client(
         callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
         client_id="rtl-fm-transcriber",
@@ -73,17 +74,81 @@ def create_mqtt_client(config):
 
     if config.get("mqtt_username"):
         client.username_pw_set(config["mqtt_username"], config.get("mqtt_password", ""))
+        logger.info(f"[MQTT] Username configured for broker at {config['mqtt_host']}")
+    else:
+        logger.info("[MQTT] No username configured (anonymous connection)")
+
+    logger.info(
+        f"[MQTT] Connecting to broker at {config['mqtt_host']}:{config['mqtt_port']} (timeout: 60s)..."
+    )
 
     try:
         client.connect(config["mqtt_host"], config["mqtt_port"], 60)
+        logger.info("[MQTT] Connect packet sent, starting network loop...")
         client.loop_start()
-        logger.info(
-            f"Connected to MQTT broker at {config['mqtt_host']}:{config['mqtt_port']}"
-        )
+        logger.info("[MQTT] Network loop started (background thread)")
+
+        # Verify connection state after starting the loop
+        import time as _time
+        _time.sleep(0.5)  # Give network thread time to establish connection
+        if client.is_connected():
+            logger.info(
+                f"[MQTT] Successfully connected to MQTT broker at {config['mqtt_host']}:{config['mqtt_port']}"
+            )
+        else:
+            logger.warning(
+                f"[MQTT] loop_start() returned but client.is_connected() is False — "
+                f"connection may not be established yet"
+            )
         return client
     except Exception as e:
-        logger.error(f"Failed to connect to MQTT broker: {e}")
+        logger.error(f"[MQTT] Failed to connect to MQTT broker at {config['mqtt_host']}:{config['mqtt_port']}: {e}")
         raise
+
+
+def is_mqtt_connected(client):
+    """Check if MQTT client is still connected and reconnect if needed.
+    
+    Args:
+        client: MQTT client instance
+        
+    Returns:
+        True if connected (or reconnected), False if reconnection failed
+    """
+    try:
+        if client.is_connected():
+            return True
+        
+        logger.warning("[MQTT] Client reports disconnected — attempting reconnection...")
+        reconnect_delay = 1.0
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            logger.info(
+                f"[MQTT] Reconnection attempt {attempt}/{max_retries}..."
+            )
+            try:
+                client.reconnect()
+                if client.is_connected():
+                    logger.info(f"[MQTT] Reconnected successfully on attempt {attempt}")
+                    return True
+                else:
+                    logger.warning(f"[MQTT] Reconnect returned but not connected (attempt {attempt})")
+            except Exception as reconnect_err:
+                logger.error(
+                    f"[MQTT] Reconnection attempt {attempt} failed: {reconnect_err}"
+                )
+            
+            if attempt < max_retries:
+                delay = reconnect_delay * attempt
+                logger.info(f"[MQTT] Waiting {delay:.1f}s before next reconnection attempt...")
+                import time as _time
+                _time.sleep(delay)
+        
+        logger.error("[MQTT] All reconnection attempts failed — MQTT publishing will be skipped")
+        return False
+    except Exception as e:
+        logger.error(f"[MQTT] Error checking connection state: {e}")
+        return False
 
 
 async def transcribe_wyoming(audio_path, whisper_url, connection_timeout=30):
@@ -780,10 +845,19 @@ async def process_buffer(audio_data, config, mqtt_client, baseline_tracker=None)
         # VAD Check
         vad_threshold = config.get("vad_threshold", 0.05)
         vad_baseline_window = config.get("vad_baseline_window", 30)
-        if not check_audio_has_voice(wav_path, vad_threshold,
-                                      baseline_tracker, vad_baseline_window):
+        vad_passed = check_audio_has_voice(wav_path, vad_threshold,
+                                      baseline_tracker, vad_baseline_window)
+        if not vad_passed:
+            logger.warning(
+                f"[VAD] Audio rejected — buffer of {len(audio_data)/2/16000:.1f}s discarded "
+                f"(RMS below threshold, no voice detected)"
+            )
             os.unlink(wav_path)
             return
+        logger.info(
+            f"[VAD] Audio passed voice activity check — "
+            f"buffer size: {len(audio_data)/2/16000:.1f}s, proceeding to transcription"
+        )
 
         # Debug Audio: Save passed audio (what is sending to Whisper)
         if config.get("debug_audio"):
@@ -819,7 +893,33 @@ async def process_buffer(audio_data, config, mqtt_client, baseline_tracker=None)
                     "frequency": str(config["frequency"]),
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
-                mqtt_client.publish(config["mqtt_topic"], json.dumps(message), qos=1)
+                mqtt_topic = config["mqtt_topic"]
+                mqtt_payload = json.dumps(message)
+                logger.info(
+                    f"[MQTT] Publishing transcription to topic='{mqtt_topic}', "
+                    f"payload='{mqtt_payload}', qos=1"
+                )
+                
+                # Check MQTT connection before publishing
+                if not is_mqtt_connected(mqtt_client):
+                    logger.error(
+                        "[MQTT] Failed to publish — MQTT client is disconnected "
+                        "and reconnection attempts failed"
+                    )
+                else:
+                    try:
+                        pub_result = mqtt_client.publish(
+                            mqtt_topic, mqtt_payload, qos=1
+                        )
+                        logger.info(
+                            f"[MQTT] Publish successful — topic='{mqtt_topic}', "
+                            f"pubmid={pub_result.mid}, result_code={pub_result.rc}"
+                        )
+                    except Exception as publish_err:
+                        logger.error(
+                            f"[MQTT] Publish failed with exception: type={type(publish_err).__name__}, "
+                            f"error={publish_err}"
+                        )
 
         os.unlink(wav_path)
 
@@ -837,8 +937,7 @@ def publish_discovery(config, mqtt_client):
     device_name = f"RTL-FM Scanner {config['frequency']}MHz"
 
     discovery_topic = f"homeassistant/sensor/{unique_id}/transcription/config"
-
-    payload = {
+    discovery_payload = json.dumps({
         "name": "Radio Transcription",
         "unique_id": f"{unique_id}_transcription",
         "state_topic": config["mqtt_topic"],
@@ -851,10 +950,30 @@ def publish_discovery(config, mqtt_client):
             "model": "RTL-SDR",
             "manufacturer": "RTL-FM Transcriber",
         },
-    }
+    })
 
-    mqtt_client.publish(discovery_topic, json.dumps(payload), retain=True)
-    logger.info(f"Published Discovery to {discovery_topic}")
+    logger.info(
+        f"[MQTT] Publishing Home Assistant Discovery to topic='{discovery_topic}', "
+        f"retain=True, payload='{discovery_payload[:100]}...'"
+    )
+
+    try:
+        if not is_mqtt_connected(mqtt_client):
+            logger.error(
+                "[MQTT] Failed to publish Discovery — MQTT client is disconnected"
+            )
+            return
+        
+        pub_result = mqtt_client.publish(discovery_topic, discovery_payload, retain=True)
+        logger.info(
+            f"[MQTT] Discovery published successfully — topic='{discovery_topic}', "
+            f"pubmid={pub_result.mid}, result_code={pub_result.rc}"
+        )
+    except Exception as e:
+        logger.error(
+            f"[MQTT] Discovery publish failed with exception: type={type(e).__name__}, "
+            f"error={e}"
+        )
 
 
 def main():
