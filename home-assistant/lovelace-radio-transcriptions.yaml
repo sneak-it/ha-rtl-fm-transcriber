@@ -1,0 +1,59 @@
+# ============================================================
+# RTL-FM Transcription Stream - Lovelace Dashboard Card
+# ============================================================
+
+type: vertical-stack
+cards:
+  - type: custom:stack-in-card
+    cards:
+      - type: horizontal-stack
+        cards:
+          - type: custom:mushroom-template-card
+            primary: Radio Transcriptions
+            secondary: >-
+              {{ state_attr('sensor.radio_transcription_history', 'history') |
+              default([], true) | length }} recent
+            icon: mdi:radio-handheld
+            icon_color: blue
+            entity: sensor.radio_transcription_history
+            tap_action:
+              action: more-info
+          - type: custom:mushroom-template-card
+            primary: >-
+              {{ state_attr('sensor.radio_transcription_history',
+              'last_transcription') | default('Waiting for transcriptions...',
+              true) | truncate(40, true, '...') }}
+            secondary: >-
+              {{ state_attr('sensor.radio_transcription_history',
+              'last_timestamp') | default('N/A', true) }} | {{
+              state_attr('sensor.radio_transcription_history', 'last_frequency')
+              | default('N/A', true) }} MHz
+            icon: mdi:message-text
+            icon_color: green
+            entity: sensor.radio_transcription_history
+            tap_action:
+              action: more-info
+  - type: markdown
+    content: >-
+      {% set history = state_attr('sensor.radio_transcription_history',
+      'history') | default([], true) %}
+
+      {% if history | length == 0 %}
+
+      **No transcriptions received yet.**
+
+      {% else %}
+
+      {% for entry in history[-5:] | reverse %}
+
+      ---
+
+      **{{ as_timestamp(entry.timestamp) | timestamp_custom('%H:%M:%S %m/%d/%y')
+      | default('Unknown', true) }}** — {{ entry.frequency | default('Unknown',
+      true) }} MHz
+
+      {{ entry.text | default('No text', true) }}
+
+      {% endfor %}
+
+      {% endif %}

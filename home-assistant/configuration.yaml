@@ -1,0 +1,45 @@
+template:
+  - triggers:
+      - platform: mqtt
+        topic: "radio/transcription"
+    sensor:
+      - name: "Radio Transcription History"
+        unique_id: rtl_fm_transcription_history
+        state: "{{ trigger.payload }}"
+        attributes:
+          # Parse incoming message and append to existing history array
+          # Keeps only the last 20 entries to prevent unbounded growth
+          history: >-
+            {% set new_entry = trigger.payload_json | default({}) %}
+            {% set current = state_attr('sensor.radio_transcription_history', 'history') | default([], true) %}
+            {% set updated = current + [new_entry] %}
+            {% set limited = updated[-20:] %}
+            {{ limited | tojson }}
+          last_transcription: "{{ new_entry.text | default('') }}"
+          last_frequency: "{{ new_entry.frequency | default('') }}"
+          last_timestamp: "{{ new_entry.timestamp | default('') }}"
+
+# ----------------------------------------------------------
+# Optional Automation: Transcription Notifications
+# ----------------------------------------------------------
+# Uncomment and customize to receive mobile notifications
+# when new transcriptions are received.
+#
+# Replace 'notify.mobile_app_your_phone' with your actual
+# notification device ID (find it in: Settings > Devices & Services > Mobile App)
+#
+# automation:
+#   - alias: "RTL-FM Transcription Notification"
+#     description: "Notify when a new radio transcription is received"
+#     trigger:
+#       - platform: mqtt
+#         topic: "radio/transcription"
+#     condition:
+#       - condition: template
+#         value_template: "{{ (trigger.payload_json.text | default('') | trim) | length > 3 }}"
+#     action:
+#       - service: notify.mobile_app_your_phone
+#         data:
+#           title: "Radio Transcription"
+#           message: "{{ trigger.payload_json.text }}"
+#     mode: single
