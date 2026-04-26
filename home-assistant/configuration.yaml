@@ -5,7 +5,8 @@ template:
     sensor:
       - name: "Radio Transcription History"
         unique_id: rtl_fm_transcription_history
-        state: "{{ trigger.payload }}"
+        state: >-
+          {{ 'Active' if (trigger.payload_json.text | default('') | trim) | length > 3 else 'Idle' }}
         attributes:
           # Parse incoming message and append to existing history array
           # Keeps only the last 20 entries to prevent unbounded growth
@@ -15,9 +16,9 @@ template:
             {% set updated = current + [new_entry] %}
             {% set limited = updated[-20:] %}
             {{ limited | tojson }}
-          last_transcription: "{{ new_entry.text | default('') }}"
-          last_frequency: "{{ new_entry.frequency | default('') }}"
-          last_timestamp: "{{ new_entry.timestamp | default('') }}"
+          last_transcription: "{{ trigger.payload_json.text | default('') }}"
+          last_frequency: "{{ trigger.payload_json.frequency | default('') }}"
+          last_timestamp: "{{ trigger.payload_json.timestamp | default('') }}"
 
 # ----------------------------------------------------------
 # Optional Automation: Transcription Notifications

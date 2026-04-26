@@ -8,10 +8,11 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import re
+import struct
 import subprocess
-import tempfile
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -53,7 +54,7 @@ def load_config():
         "mqtt_topic": "radio/transcription",
         "mqtt_username": "",
         "mqtt_password": "",
-        "vad_threshold": 0.01,
+        "vad_threshold": 0.03,
         "vad_baseline_window": 30,
         "gain": "auto",
         "debug_audio": False,
@@ -62,6 +63,12 @@ def load_config():
         "bandpass_low": 300,
         "bandpass_high": 3000,
         "timezone": "UTC",
+        # Streaming segmentation options
+        "silence_timeout": 2.0,
+        "vad_warmup_ms": 150,
+        "min_transmission_duration": 0.3,
+        "max_transmission_duration": 120.0,
+        "vad_recovery_seconds": 1.0,
     }
 
 
@@ -148,8 +155,8 @@ def create_mqtt_client(config):
             )
         else:
             logger.warning(
-                f"[MQTT] loop_start() returned but client.is_connected() is False — "
-                f"connection may not be established yet"
+                "[MQTT] loop_start() returned but client.is_connected() is False — "
+                "connection may not be established yet"
             )
         return client
     except Exception as e:
@@ -278,6 +285,56 @@ async def transcribe_wyoming(audio_path, whisper_url, connection_timeout=30):
         logger.error(f"Wyoming transcription error: {e}")
 
     return None
+
+
+def compute_rms(raw_bytes: bytes) -> float:
+    """Calculate RMS amplitude from raw PCM16 bytes.
+    
+    Returns normalized RMS in range [0, 1].
+    
+    Args:
+        raw_bytes: Raw PCM16 audio samples (little-endian signed 16-bit).
+        
+    Returns:
+        Normalized RMS amplitude value.
+    """
+    if len(raw_bytes) == 0:
+        return 0.0
+    
+    num_samples = len(raw_bytes) // 2
+    if num_samples == 0:
+        return 0.0
+    
+    # Unpack as little-endian signed 16-bit integers
+    samples = struct.unpack(f'<{num_samples}h', raw_bytes[:num_samples * 2])
+    
+    # Calculate RMS
+    sum_squares = sum(s * s for s in samples)
+    return math.sqrt(sum_squares / num_samples) / 32768.0
+
+
+def compute_rms_batch(raw_bytes: bytes, window_size: int = 1600) -> list[tuple[float, float]]:
+    """Calculate RMS amplitude for overlapping windows of audio data.
+    
+    Args:
+        raw_bytes: Raw PCM16 audio data.
+        window_size: Number of samples per window (default 1600 = 100ms at 16kHz).
+        
+    Returns:
+        List of (start_offset, rms) tuples for each window.
+    """
+    if len(raw_bytes) == 0:
+        return []
+    
+    samples_per_byte = 2  # 16-bit = 2 bytes per sample
+    windows = []
+    
+    for i in range(0, len(raw_bytes) - window_size * samples_per_byte + 1, window_size * samples_per_byte):
+        chunk = raw_bytes[i:i + window_size * samples_per_byte]
+        rms = compute_rms(chunk)
+        windows.append((i / samples_per_byte, rms))
+    
+    return windows
 
 
 class _RmsBaselineTracker:
@@ -474,6 +531,352 @@ def _check_voice(rms: float, threshold: float,
         baseline_tracker.add_sample(rms, current_time)
 
     return voice_detected
+
+
+class _WyomingStreamingClient:
+    """Manages streaming ASR connection to Wyoming server.
+    
+    Handles the Wyoming protocol streaming flow:
+    AudioStart → streaming AudioChunk → AudioStop → transcript
+    
+    Includes connection lifecycle management with timeout, reconnection
+    with exponential backoff, and error classification for graceful handling
+    of server disconnects, unavailability, and network issues.
+    """
+    
+    # Connection states
+    STATE_DISCONNECTED = "DISCONNECTED"
+    STATE_CONNECTING = "CONNECTING"
+    STATE_CONNECTED = "CONNECTED"
+    STATE_RECONNECTING = "RECONNECTING"
+    
+    def __init__(self) -> None:
+        """Initialize the streaming client."""
+        self.client: Optional[AsyncTcpClient] = None
+        self.transcript_parts: list[str] = []
+        self.final_transcript: Optional[str] = None
+        self._session_active: bool = False
+        self._connection_state: str = self.STATE_DISCONNECTED
+        self._last_error: Optional[str] = None
+        self._last_error_time: float = 0.0
+    
+    def _classify_error(self, e: Exception) -> str:
+        """Classify a Wyoming connection error for logging.
+        
+        Returns a string describing the error type:
+        - 'connection_refused': Server is down or port not listening
+        - 'connection_timeout': Connection attempt timed out
+        - 'connection_reset': Connection was reset by peer (server crashed)
+        - 'connection_lost': Connection dropped unexpectedly
+        - 'timeout_waiting_for_response': Server didn't respond in time
+        - 'unknown': Unclassified error
+        """
+        if isinstance(e, ConnectionRefusedError):
+            return "connection_refused"
+        elif isinstance(e, asyncio.TimeoutError):
+            return "timeout"
+        elif isinstance(e, ConnectionResetError):
+            return "connection_reset"
+        elif isinstance(e, BrokenPipeError):
+            return "connection_lost"
+        elif isinstance(e, OSError):
+            if e.errno == 110:  # ETIMEDOUT
+                return "connection_timeout"
+            elif e.errno == 104:  # ECONNRESET
+                return "connection_reset"
+            return f"os_error_{e.errno or 'unknown'}"
+        elif "timeout" in str(e).lower():
+            return "timeout"
+        elif "connection" in str(e).lower():
+            return "connection_error"
+        else:
+            return f"unknown_{type(e).__name__}"
+    
+    async def connect(self, host: str, port: int, timeout: float = 10.0) -> bool:
+        """Connect to Wyoming server with timeout and logging.
+        
+        Args:
+            host: Wyoming server hostname.
+            port: Wyoming server port.
+            timeout: Seconds to wait for connection.
+            
+        Returns:
+            True if connected, False on failure.
+        """
+        self._connection_state = self.STATE_CONNECTING
+        self._last_error = None
+        self._last_error_time = time.time()
+        
+        try:
+            self.client = AsyncTcpClient(host, port)
+            # Use context manager for proper cleanup
+            await self.client.__aenter__()
+            
+            self._connection_state = self.STATE_CONNECTED
+            self._last_error = None
+            logger.info(f"[Wyoming] Connected to {host}:{port}")
+            return True
+            
+        except asyncio.TimeoutError:
+            self._connection_state = self.STATE_DISCONNECTED
+            self._last_error = "connection_timeout"
+            logger.error(f"[Wyoming] Connection to {host}:{port} timed out after {timeout}s")
+            return False
+        except ConnectionRefusedError:
+            self._connection_state = self.STATE_DISCONNECTED
+            self._last_error = "connection_refused"
+            logger.error(f"[Wyoming] Connection to {host}:{port} refused (server down?)")
+            return False
+        except OSError as e:
+            self._connection_state = self.STATE_DISCONNECTED
+            self._last_error = f"os_error_{e.errno or 'unknown'}"
+            logger.error(f"[Wyoming] OS error connecting to {host}:{port}: {e}")
+            return False
+        except Exception as e:
+            self._connection_state = self.STATE_DISCONNECTED
+            self._last_error = f"unknown_{type(e).__name__}"
+            logger.error(f"[Wyoming] Unexpected error connecting to {host}:{port}: {e}")
+            return False
+    
+    async def disconnect(self) -> None:
+        """Gracefully close the Wyoming connection."""
+        if self.client is not None:
+            try:
+                await self.client.__aexit__(None, None, None)
+                logger.debug("[Wyoming] Connection closed gracefully")
+            except Exception as e:
+                logger.warning(f"[Wyoming] Error closing connection: {e}")
+            self.client = None
+        self._connection_state = self.STATE_DISCONNECTED
+        self._session_active = False
+    
+    def is_connected(self) -> bool:
+        """Check if Wyoming connection is healthy.
+        
+        Returns:
+            True if connection state is CONNECTED and client exists.
+        """
+        return (
+            self._connection_state == self.STATE_CONNECTED
+            and self.client is not None
+        )
+    
+    async def _reconnect_with_backoff(
+        self, config: dict, host: str, port: int
+    ) -> bool:
+        """Reconnect to Wyoming with exponential backoff.
+        
+        Args:
+            config: Configuration dictionary.
+            host: Wyoming server hostname.
+            port: Wyoming server port.
+            
+        Returns:
+            True if reconnected, False after max retries.
+        """
+        max_attempts = config.get("wyoming_reconnect_max_attempts", 3)
+        base_delay = config.get("wyoming_reconnect_delay", 1.0)
+        
+        for attempt in range(1, max_attempts + 1):
+            delay = base_delay * (2 ** (attempt - 1))  # 1s, 2s, 4s...
+            self._connection_state = self.STATE_RECONNECTING
+            logger.info(
+                f"[Wyoming] Reconnection attempt {attempt}/{max_attempts} "
+                f"in {delay:.1f}s to {host}:{port}"
+            )
+            await asyncio.sleep(delay)
+            
+            if await self.connect(host, port):
+                self._connection_state = self.STATE_CONNECTED
+                logger.info(
+                    f"[Wyoming] Reconnected successfully on attempt {attempt}"
+                )
+                return True
+            else:
+                logger.warning(
+                    f"[Wyoming] Reconnection attempt {attempt}/{max_attempts} failed"
+                )
+        
+        self._connection_state = self.STATE_DISCONNECTED
+        logger.error(
+            f"[Wyoming] All {max_attempts} reconnection attempts failed. "
+            f"Will retry on next transmission."
+        )
+        return False
+    
+    async def start_session(
+        self, client: AsyncTcpClient, language: Optional[str] = None
+    ) -> None:
+        """Send transcribe and AudioStart events to begin a transcription session.
+        
+        Args:
+            client: AsyncTcpClient connected to the Wyoming server.
+            language: Optional language code (e.g., 'en').
+        """
+        self.client = client
+        self.transcript_parts = []
+        self.final_transcript = None
+        self._session_active = True
+        
+        # Send transcribe event (optional, can specify language)
+        if language:
+            await client.write_event(Transcribe(language=language).event())
+        else:
+            await client.write_event(Transcribe().event())
+        
+        # Send AudioStart
+        await client.write_event(
+            AudioStart(rate=16000, width=2, channels=1).event()
+        )
+        logger.debug("[Wyoming] AudioStart sent")
+    
+    async def send_chunk(self, data: bytes) -> None:
+        """Stream audio chunks to the server.
+        
+        Args:
+            data: Raw PCM16 audio bytes (16kHz, mono, 16-bit).
+            
+        Raises:
+            Exception: Propagates connection errors for caller to handle.
+        """
+        if not self._session_active or self.client is None:
+            logger.error("[Wyoming] Cannot send chunk: session not active")
+            raise RuntimeError("Session not active")
+        
+        # Send in 1024-byte chunks
+        chunk_size = 1024
+        for i in range(0, len(data), chunk_size):
+            chunk = data[i:i + chunk_size]
+            await self.client.write_event(
+                AudioChunk(rate=16000, width=2, channels=1, audio=chunk).event()
+            )
+    
+    async def stop_session(self, timeout: float = 30.0) -> Optional[str]:
+        """Send AudioStop and wait for the final transcript.
+        
+        Args:
+            timeout: Seconds to wait for the transcript.
+            
+        Returns:
+            The final transcript text, or None on failure.
+        """
+        if not self._session_active or self.client is None:
+            logger.error("[Wyoming] Cannot stop session: session not active")
+            return None
+        
+        # Send AudioStop
+        await self.client.write_event(AudioStop().event())
+        logger.debug("[Wyoming] AudioStop sent, waiting for transcript...")
+        
+        # Wait for transcript
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(
+                        self.client.read_event(), timeout=timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"[Wyoming] No transcript received within {timeout}s"
+                    )
+                    break
+                
+                if event is None:
+                    logger.warning("[Wyoming] Connection closed by server")
+                    break
+                
+                if Transcript.is_type(event.type):
+                    transcript = Transcript.from_event(event)
+                    self.final_transcript = transcript.text
+                    logger.debug(
+                        f"[Wyoming] Transcript received: '{self.final_transcript}'"
+                    )
+                    break
+                
+                # Ignore transcript-chunk events (we only need the final result)
+        
+        except Exception as e:
+            error_type = self._classify_error(e)
+            logger.error(
+                f"[Wyoming] Error waiting for transcript ({error_type}): {e}"
+            )
+        
+        self._session_active = False
+        return self.final_transcript
+    
+    @property
+    def is_active(self) -> bool:
+        """Check if a session is currently active."""
+        return self._session_active
+    
+    @property
+    def connection_state(self) -> str:
+        """Current Wyoming connection state."""
+        return self._connection_state
+
+
+class _TransmissionState:
+    """Tracks state of a streaming radio transmission.
+    
+    States:
+        IDLE: No active transmission
+        WARMUP: Voice detected, buffering audio (AGC stabilization)
+        STREAMING: Actively streaming audio to Wyoming
+        SILENCE_DETECTED: Voice stopped, waiting for silence timeout
+        WAITING_FOR_END: Silence timeout elapsed, about to end transmission
+        TRANSCRIBING: Sent AudioStop, waiting for transcript
+    """
+    
+    def __init__(self, config: dict, baseline_tracker: _RmsBaselineTracker) -> None:
+        """Initialize the transmission state.
+        
+        Args:
+            config: Configuration dictionary.
+            baseline_tracker: VAD baseline tracker instance.
+        """
+        self.config = config
+        self.baseline_tracker = baseline_tracker
+        
+        # Timing parameters
+        self.silence_timeout = config.get("vad_recovery_seconds", 1.0)
+        self.silence_recovery = config.get("silence_timeout", 2.0)
+        self.min_duration = config.get("min_transmission_duration", 0.3)
+        self.max_duration = config.get("max_transmission_duration", 120.0)
+        self.warmup_ms = config.get("vad_warmup_ms", 150)
+        self.vad_threshold = config.get("vad_threshold", 0.03)
+        
+        # State tracking
+        self.state: str = "IDLE"
+        self.start_time: float = 0.0
+        self.silence_start: float = 0.0
+        self.end_time: float = 0.0
+        
+        # Audio buffer (for warmup period)
+        self.warmup_buffer: bytearray = bytearray()
+        
+        # Wyoming streaming
+        self.wyoming: _WyomingStreamingClient = _WyomingStreamingClient()
+        
+        # Transcript result
+        self.transcript: Optional[str] = None
+    
+    @property
+    def duration(self) -> float:
+        """Current transmission duration in seconds."""
+        if self.start_time == 0.0:
+            return 0.0
+        end = self.end_time if self.end_time > 0 else time.time()
+        return end - self.start_time
+    
+    def reset(self) -> None:
+        """Reset state to IDLE."""
+        self.state = "IDLE"
+        self.start_time = 0.0
+        self.silence_start = 0.0
+        self.end_time = 0.0
+        self.warmup_buffer = bytearray()
+        self.transcript = None
+        self.wyoming = _WyomingStreamingClient()
 
 
 def is_hallucination(text):
@@ -684,19 +1087,27 @@ async def _cleanup_pipeline(rtl_proc, sox_proc):
 
 
 async def capture_loop(config, mqtt_client):
-    """Async capture loop with persistent pipeline and automatic restart.
+    """Async capture loop with persistent pipeline and streaming transcription.
+
+    Implements a state machine for radio transmission segmentation:
+    IDLE → WARMUP → STREAMING → SILENCE_DETECTED → WAITING_FOR_END → TRANSCRIBING → IDLE
+    
+    Audio is streamed directly to Wyoming as it arrives, with VAD driving
+    real-time segmentation based on RMS amplitude drops below baseline.
 
     Implements exponential backoff restart on pipeline failure.
     """
     frequency_hz = int(config["frequency"] * 1_000_000)
     sample_rate = 16000
-    max_duration = config["chunk_duration"]
-    silence_timeout = 2.0
     # 12000 Hz sample rate for narrowband FM (12.5 kHz public safety channels)
     capture_rate = 12000
-    bytes_per_sec = sample_rate * 2  # 16-bit mono
 
-    logger.info(f"Starting persistent capture on {config['frequency']} MHz")
+    logger.info("Starting persistent capture with streaming transcription")
+    logger.info(f"  Frequency: {config['frequency']} MHz")
+    logger.info(f"  Silence timeout: {config.get('silence_timeout', 2.0)}s")
+    logger.info(f"  VAD recovery: {config.get('vad_recovery_seconds', 1.0)}s")
+    logger.info(f"  Min transmission: {config.get('min_transmission_duration', 0.3)}s")
+    logger.info(f"  Max transmission: {config.get('max_transmission_duration', 120.0)}s")
 
     retry_count = 0
     stderr_reader_task = None
@@ -723,10 +1134,16 @@ async def capture_loop(config, mqtt_client):
 
         logger.info("Pipeline started. Waiting for audio...")
 
-        buffer = bytearray()
-        last_data_time = time.time()
+        # Transmission state machine
+        transmission = _TransmissionState(config, baseline_tracker)
         pipeline_running = True
         stderr_reader_task = None
+        # Track bytes per second for warmup buffer sizing
+        bytes_per_sec = sample_rate * 2  # 16-bit mono
+        warmup_bytes = int(config.get("vad_warmup_ms", 150) / 1000.0 * bytes_per_sec)
+
+        # Wyoming connection pool - one connection per pipeline lifetime
+        wyoming_client: Optional[AsyncTcpClient] = None
 
         try:
             # Start concurrent stderr reader
@@ -739,19 +1156,23 @@ async def capture_loop(config, mqtt_client):
                 # Use asyncio.wait_for with a timeout to periodically check pipeline health
                 try:
                     chunk = await asyncio.wait_for(
-                        sox_proc.stdout.read(4096), timeout=0.1
+                        sox_proc.stdout.read(4096), timeout=0.05
                     )
                 except asyncio.TimeoutError:
-                    # No data available - check for silence timeout
-                    if len(buffer) > 0:
-                        time_since_last = time.time() - last_data_time
-                        if time_since_last > silence_timeout:
-                            logger.info(
-                                f"Silence detected ({silence_timeout}s), processing transmission"
-                            )
-                            await process_buffer(buffer, config, mqtt_client,
-                                                 baseline_tracker=baseline_tracker)
-                            buffer = bytearray()
+                    # No data available - check pipeline health
+                    if transmission.state == "STREAMING" or transmission.state == "WAITING_FOR_END":
+                        # Check if silence timeout elapsed while streaming
+                        if transmission.silence_start > 0:
+                            elapsed = time.time() - transmission.silence_start
+                            if elapsed >= transmission.silence_recovery:
+                                logger.info(
+                                    f"[VAD] Silence timeout ({transmission.silence_recovery}s) reached, "
+                                    f"ending transmission (duration: {transmission.duration:.1f}s)"
+                                )
+                                await _end_transmission(transmission, config, mqtt_client,
+                                                       wyoming_client)
+                                wyoming_client = None
+                                transmission.reset()
                     await asyncio.sleep(0.01)
                     continue
                 except asyncio.CancelledError:
@@ -763,30 +1184,164 @@ async def capture_loop(config, mqtt_client):
                     pipeline_running = False
                     break
 
-                buffer.extend(chunk)
-                last_data_time = time.time()
+                current_time = time.time()
+                rms = compute_rms(chunk)
 
-                # If buffer gets too big (max duration), force process it
-                if len(buffer) > max_duration * bytes_per_sec:
-                    logger.info("Max duration reached, forcing transcription")
-                    await process_buffer(buffer, config, mqtt_client,
-                                         baseline_tracker=baseline_tracker)
-                    buffer = bytearray()
+                # Get current baseline for VAD decision
+                baseline = baseline_tracker.get_baseline(current_time)
+                vad_threshold = config.get("vad_threshold", 0.03)
 
-                # Check if processes still alive (asyncio.Process uses .returncode, not .poll())
-                if sox_proc.returncode is not None:
-                    logger.error(
-                        f"Sox process exited unexpectedly (return code: {sox_proc.returncode})"
-                    )
-                    pipeline_running = False
-                    break
+                if baseline is not None and rms < (baseline - vad_threshold):
+                    # Voice activity detected (RMS drops below baseline)
+                    if transmission.state == "IDLE":
+                        logger.info(
+                            f"[VAD] Transmission started — RMS: {rms:.4f} "
+                            f"(baseline: {baseline:.4f}, threshold: {vad_threshold})"
+                        )
+                        transmission.state = "WARMUP"
+                        transmission.start_time = current_time
+                        transmission.warmup_buffer = bytearray(chunk)
+                        baseline_tracker.add_sample(baseline, current_time)
+                    elif transmission.state in ("STREAMING", "WAITING_FOR_END"):
+                        # Voice resumed during recovery period
+                        transmission.state = "STREAMING"
+                        transmission.silence_start = 0.0
+                        logger.debug("[VAD] Voice resumed during recovery period")
+                else:
+                    # No voice activity (idle noise or silence)
+                    if transmission.state == "IDLE":
+                        # Track baseline
+                        baseline_tracker.add_sample(rms, current_time)
+                    elif transmission.state == "WARMUP":
+                        # Still buffering during warmup
+                        transmission.warmup_buffer.extend(chunk)
+                        
+                        # Check warmup timeout (safety: don't buffer forever)
+                        if current_time - transmission.start_time > 2.0:
+                            logger.warning("[VAD] Warmup timeout, starting streaming")
+                            transmission.state = "STREAMING"
+                        
+                        # Check if warmup buffer is large enough
+                        if len(transmission.warmup_buffer) >= warmup_bytes:
+                            logger.debug("[VAD] Warmup period complete, starting streaming")
+                            transmission.state = "STREAMING"
+                            
+                            # Connect to Wyoming and start session
+                            wyoming_host = urlparse(config["whisper_url"]).hostname or "localhost"
+                            wyoming_port = urlparse(config["whisper_url"]).port or 10300
+                            wyoming_conn_timeout = config.get("wyoming_connection_timeout", 10.0)
+                            
+                            if not transmission.wyoming.is_connected():
+                                logger.info(
+                                    f"[Wyoming] Connection not available, attempting to connect "
+                                    f"to {wyoming_host}:{wyoming_port}..."
+                                )
+                                connected = await transmission.wyoming.connect(
+                                    wyoming_host, wyoming_port, timeout=wyoming_conn_timeout
+                                )
+                                if not connected:
+                                    # Try reconnecting with backoff
+                                    reconnected = await transmission.wyoming._reconnect_with_backoff(
+                                        config, wyoming_host, wyoming_port
+                                    )
+                                    if not reconnected:
+                                        logger.warning(
+                                            "[Wyoming] Unable to connect to server. "
+                                            "Transmission will be skipped."
+                                        )
+                                        transmission.state = "IDLE"
+                                        wyoming_client = None
+                                        continue
+                            
+                            wyoming_client = transmission.wyoming.client
+                            try:
+                                await transmission.wyoming.start_session(wyoming_client)
+                                # Send warmup buffer
+                                await transmission.wyoming.send_chunk(
+                                    bytes(transmission.warmup_buffer)
+                                )
+                            except Exception as e:
+                                error_type = transmission.wyoming._classify_error(e)
+                                logger.error(
+                                    f"[Wyoming] Failed to start session ({error_type}): {e}"
+                                )
+                                transmission.state = "IDLE"
+                                wyoming_client = None
+                    elif transmission.state in ("STREAMING", "WAITING_FOR_END"):
+                        # Voice stopped - start silence timer
+                        if transmission.silence_start == 0.0:
+                            transmission.silence_start = current_time
+                            logger.debug(
+                                f"[VAD] Silence detected, recovery timeout: "
+                                f"{transmission.silence_recovery}s"
+                            )
+                        
+                        # Check if we've exceeded max transmission duration
+                        if transmission.duration >= transmission.max_duration:
+                            logger.warning(
+                                f"[VAD] Max transmission duration ({transmission.max_duration}s) "
+                                f"reached, ending transmission"
+                            )
+                            await _end_transmission(transmission, config, mqtt_client,
+                                                   wyoming_client)
+                            wyoming_client = None
+                            transmission.reset()
 
-                if rtl_proc.returncode is not None:
-                    logger.error(
-                        f"RTL_FM process exited unexpectedly (return code: {rtl_proc.returncode})"
-                    )
-                    pipeline_running = False
-                    break
+                # In WAITING_FOR_END state, check if silence timeout elapsed
+                if transmission.state == "WAITING_FOR_END":
+                    if current_time - transmission.silence_start >= transmission.silence_recovery:
+                        logger.info(
+                            f"[VAD] Silence timeout ({transmission.silence_recovery}s) reached, "
+                            f"ending transmission (duration: {transmission.duration:.1f}s)"
+                        )
+                        await _end_transmission(transmission, config, mqtt_client,
+                                               wyoming_client)
+                        wyoming_client = None
+                        transmission.reset()
+
+                # Stream audio to Wyoming if actively speaking
+                if transmission.state == "STREAMING" and wyoming_client is not None:
+                    try:
+                        await transmission.wyoming.send_chunk(chunk)
+                    except Exception as e:
+                        error_type = transmission.wyoming._classify_error(e)
+                        logger.error(
+                            f"[Wyoming] Failed to send chunk ({error_type}): {e}"
+                        )
+                        
+                        # Try to reconnect for transient errors
+                        if error_type in ("connection_reset", "connection_lost"):
+                            wyoming_host = urlparse(config["whisper_url"]).hostname or "localhost"
+                            wyoming_port = urlparse(config["whisper_url"]).port or 10300
+                            logger.info(
+                                "[Wyoming] Connection lost mid-stream, attempting reconnect..."
+                            )
+                            reconnected = await transmission.wyoming._reconnect_with_backoff(
+                                config, wyoming_host, wyoming_port
+                            )
+                            if reconnected:
+                                # Restart session on new connection
+                                wyoming_client = transmission.wyoming.client
+                                try:
+                                    await transmission.wyoming.start_session(wyoming_client)
+                                    logger.info(
+                                        "[Wyoming] Reconnected and session restarted"
+                                    )
+                                except Exception as reconnect_err:
+                                    logger.error(
+                                        f"[Wyoming] Failed to restart session after reconnect: {reconnect_err}"
+                                    )
+                                    transmission.state = "IDLE"
+                                    wyoming_client = None
+                            else:
+                                logger.error(
+                                    "[Wyoming] Reconnection failed, skipping transmission"
+                                )
+                                transmission.state = "IDLE"
+                                wyoming_client = None
+                        else:
+                            transmission.state = "IDLE"
+                            wyoming_client = None
 
         except Exception as e:
             logger.error(f"Capture loop error: {e}")
@@ -826,6 +1381,15 @@ async def capture_loop(config, mqtt_client):
                 f"Pipeline status - RTL_FM: {'exited' if rtl_ret is not None else 'running'}({rtl_ret}), SOX: {'exited' if sox_ret is not None else 'running'}({sox_ret})"
             )
 
+            # Cleanup any in-progress Wyoming connection
+            if transmission.wyoming.is_connected():
+                try:
+                    await transmission.wyoming.disconnect()
+                    logger.info("[Wyoming] Connection closed gracefully")
+                except Exception as e:
+                    logger.warning(f"[Wyoming] Error closing connection: {e}")
+            transmission.wyoming._connection_state = transmission.wyoming.STATE_DISCONNECTED
+
             # Cleanup processes
             await _cleanup_pipeline(rtl_proc, sox_proc)
 
@@ -844,141 +1408,81 @@ async def capture_loop(config, mqtt_client):
         await asyncio.sleep(delay)
 
 
-async def process_buffer(audio_data, config, mqtt_client, baseline_tracker=None):
-    """Save buffer to WAV and transcribe.
+async def _end_transmission(transmission: _TransmissionState, config: dict,
+                           mqtt_client, wyoming_client) -> None:
+    """End a transmission: send AudioStop, get transcript, publish to MQTT.
     
     Args:
-        audio_data: Raw audio bytes to process
-        config: Configuration dictionary
-        mqtt_client: MQTT client instance
-        baseline_tracker: Optional _RmsBaselineTracker for VAD baseline tracking
+        transmission: The _TransmissionState to finalize.
+        config: Configuration dictionary.
+        mqtt_client: MQTT client instance.
+        wyoming_client: The Wyoming streaming client (may be None on error).
     """
-    if len(audio_data) < 16000:  # Ignore tiny blips (<0.5s)
+    if transmission.state not in ("WARMUP", "STREAMING", "WAITING_FOR_END"):
         return
-
-    wav_path = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as wav_file:
-            wav_path = wav_file.name
-
-        # Write raw buf to WAV using sox (simplest way to add header)
-        # Or proper wavfile write. Let's use sox again to wrap it.
-        # Actually, python wave lib is easier/faster.
-        import wave
-
-        with wave.open(wav_path, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(16000)
-            wf.writeframes(audio_data)
-
-        # Debug Audio: Save raw capture BEFORE checks
-        if config.get("debug_audio"):
-            try:
-                debug_dir = "/config/www"
-                if os.path.exists(debug_dir) and os.path.isdir(debug_dir):
-                    import shutil
-
-                    # Save raw capture (what the loop heard)
-                    dest_path = f"{debug_dir}/rtl_last_capture.wav"
-                    shutil.copy2(wav_path, dest_path)
-                    os.chmod(dest_path, 0o600)  # Restrict permissions
-                    logger.info(f"Debug: Saved raw capture to {dest_path}")
-            except PermissionError as e:
-                logger.error(
-                    f"Failed to save debug audio (permission denied): {debug_dir}/rtl_last_capture.wav - {e}"
-                )
-            except OSError as e:
-                logger.error(f"Failed to save debug audio (OS error): {e}")
-            except Exception as e:
-                logger.debug(f"Failed to save debug audio (unexpected): {e}")
-
-        # VAD Check
-        vad_threshold = config.get("vad_threshold", 0.05)
-        vad_baseline_window = config.get("vad_baseline_window", 30)
-        vad_passed = check_audio_has_voice(wav_path, vad_threshold,
-                                      baseline_tracker, vad_baseline_window)
-        if not vad_passed:
-            logger.warning(
-                f"[VAD] Audio rejected — buffer of {len(audio_data)/2/16000:.1f}s discarded "
-                f"(RMS below threshold, no voice detected)"
-            )
-            os.unlink(wav_path)
-            return
+    
+    # Check minimum duration
+    if transmission.duration < transmission.min_duration:
         logger.info(
-            f"[VAD] Audio passed voice activity check — "
-            f"buffer size: {len(audio_data)/2/16000:.1f}s, proceeding to transcription"
+            f"[VAD] Transmission too short ({transmission.duration:.2f}s < "
+            f"{transmission.min_duration}s), discarding"
         )
-
-        # Debug Audio: Save passed audio (what is sending to Whisper)
-        if config.get("debug_audio"):
-            try:
-                dest_path = "/config/www/rtl_last_transcription.wav"
-                shutil.copy2(wav_path, dest_path)
-                os.chmod(dest_path, 0o600)  # Restrict permissions
-                logger.info(f"Debug: Saved transcription audio to {dest_path}")
-            except PermissionError as e:
-                logger.error(
-                    f"Failed to save debug transcription audio (permission denied): {e}"
-                )
-            except OSError as e:
-                logger.error(
-                    f"Failed to save debug transcription audio (OS error): {e}"
-                )
-            except Exception as e:
-                logger.debug(
-                    f"Failed to save debug transcription audio (unexpected): {e}"
-                )
-
-        # Transcribe
-        text = await transcribe_wyoming(wav_path, config["whisper_url"])
-
-        if text:
-            clean_text = text.strip()
-            if is_hallucination(clean_text):
-                logger.info(f"Filtered hallucination: '{clean_text}'")
-            else:
-                logger.info(f"Transcription: {clean_text}")
-                message = {
-                    "text": clean_text,
-                    "frequency": str(config["frequency"]),
-                    "timestamp": format_timestamp(config.get("timezone", "UTC")),
-                }
-                mqtt_topic = config["mqtt_topic"]
-                mqtt_payload = json.dumps(message)
-                logger.info(
-                    f"[MQTT] Publishing transcription to topic='{mqtt_topic}', "
-                    f"payload='{mqtt_payload}', qos=1"
-                )
-                
-                # Check MQTT connection before publishing
-                if not is_mqtt_connected(mqtt_client):
-                    logger.error(
-                        "[MQTT] Failed to publish — MQTT client is disconnected "
-                        "and reconnection attempts failed"
-                    )
-                else:
-                    try:
-                        pub_result = mqtt_client.publish(
-                            mqtt_topic, mqtt_payload, qos=1
-                        )
-                        logger.info(
-                            f"[MQTT] Publish successful — topic='{mqtt_topic}', "
-                            f"pubmid={pub_result.mid}, result_code={pub_result.rc}"
-                        )
-                    except Exception as publish_err:
-                        logger.error(
-                            f"[MQTT] Publish failed with exception: type={type(publish_err).__name__}, "
-                            f"error={publish_err}"
-                        )
-
-        os.unlink(wav_path)
-
+        transmission.state = "IDLE"
+        return
+    
+    # Send AudioStop and get transcript
+    try:
+        transcript = await transmission.wyoming.stop_session(timeout=30.0)
     except Exception as e:
-        logger.error(f"Processing error: {e}")
-        if wav_path and os.path.exists(wav_path):
-            with contextlib.suppress(ProcessLookupError):
-                os.unlink(wav_path)
+        logger.error(f"[Wyoming] Error ending transmission: {e}")
+        transmission.state = "IDLE"
+        return
+    
+    if not transcript:
+        logger.warning("[VAD] No transcript received for transmission")
+        transmission.state = "IDLE"
+        return
+    
+    clean_text = transcript.strip()
+    
+    # Check for hallucinations
+    if is_hallucination(clean_text):
+        logger.info(f"Filtered hallucination: '{clean_text}'")
+    else:
+        logger.info(f"Transcription [{transmission.duration:.1f}s]: {clean_text}")
+        
+        # Publish to MQTT
+        message = {
+            "text": clean_text,
+            "frequency": str(config["frequency"]),
+            "timestamp": format_timestamp(config.get("timezone", "UTC")),
+        }
+        mqtt_topic = config["mqtt_topic"]
+        mqtt_payload = json.dumps(message)
+        logger.info(
+            f"[MQTT] Publishing transcription to topic='{mqtt_topic}', "
+            f"payload='{mqtt_payload[:100]}...', qos=1"
+        )
+        
+        if not is_mqtt_connected(mqtt_client):
+            logger.error(
+                "[MQTT] Failed to publish — MQTT client is disconnected "
+                "and reconnection attempts failed"
+            )
+        else:
+            try:
+                pub_result = mqtt_client.publish(mqtt_topic, mqtt_payload, qos=1)
+                logger.info(
+                    f"[MQTT] Publish successful — topic='{mqtt_topic}', "
+                    f"mid={pub_result.mid}, result_code={pub_result.rc}"
+                )
+            except Exception as publish_err:
+                logger.error(
+                    f"[MQTT] Publish failed with exception: type={type(publish_err).__name__}, "
+                    f"error={publish_err}"
+                )
+    
+    transmission.state = "IDLE"
 
 
 def publish_discovery(config, mqtt_client):
@@ -1027,6 +1531,51 @@ def publish_discovery(config, mqtt_client):
         )
 
 
+async def check_wyoming_connection(config: dict) -> bool:
+    """Check Wyoming server connectivity on startup with reconnection retry.
+    
+    Args:
+        config: Configuration dictionary.
+        
+    Returns:
+        True if connected, False after max retries.
+    """
+    wyoming_host = urlparse(config["whisper_url"]).hostname or "localhost"
+    wyoming_port = urlparse(config["whisper_url"]).port or 10300
+    conn_timeout = config.get("wyoming_connection_timeout", 10.0)
+    max_attempts = config.get("wyoming_reconnect_max_attempts", 3)
+    base_delay = config.get("wyoming_reconnect_delay", 1.0)
+    
+    client = _WyomingStreamingClient()
+    
+    for attempt in range(1, max_attempts + 1):
+        delay = base_delay * (2 ** (attempt - 1))  # 1s, 2s, 4s...
+        logger.info(
+            f"[Wyoming] Startup connection attempt {attempt}/{max_attempts} "
+            f"in {delay:.1f}s to {wyoming_host}:{wyoming_port}"
+        )
+        await asyncio.sleep(delay)
+        
+        connected = await client.connect(wyoming_host, wyoming_port, timeout=conn_timeout)
+        if connected:
+            logger.info(
+                f"[Wyoming] Startup connection successful on attempt {attempt}"
+            )
+            await client.disconnect()
+            return True
+        else:
+            logger.warning(
+                f"[Wyoming] Startup connection attempt {attempt}/{max_attempts} failed"
+            )
+    
+    logger.error(
+        f"[Wyoming] All {max_attempts} startup connection attempts failed. "
+        f"The add-on will continue but transcription will not work until "
+        f"the Wyoming server is available."
+    )
+    return False
+
+
 def main():
     logger.info("RTL-FM Transcriber starting (Wyoming Protocol)...")
     config = load_config()
@@ -1043,6 +1592,14 @@ def main():
 
     # Publish HA Discovery
     publish_discovery(config, mqtt_client)
+
+    # Check Wyoming server connectivity on startup
+    wyoming_available = asyncio.run(check_wyoming_connection(config))
+    if not wyoming_available:
+        logger.warning(
+            "[Wyoming] Server not reachable at startup. "
+            "Will retry connection on next transmission."
+        )
 
     try:
         asyncio.run(capture_loop(config, mqtt_client))
