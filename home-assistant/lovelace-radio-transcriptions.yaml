@@ -44,7 +44,7 @@ cards:
 
       {% else %}
 
-      {% for entry in history[-5:] | reverse %}
+      {% for entry in history[-10:] | reverse %}
 
       ---
 
@@ -53,6 +53,15 @@ cards:
       true) }} MHz
 
       {{ entry.text | default('No text', true) }}
+
+      {% if entry.audio_file %}
+
+      <audio controls preload="none">
+      <source src="/local/radio-audio/{{ entry.audio_file | replace('radio-audio/', '') }}" type="audio/wav">
+      Your browser does not support the audio element.
+      </audio>
+
+      {% endif %}
 
       {% endfor %}
 

@@ -46,6 +46,10 @@ options:
   wyoming_read_timeout: 30.0
   wyoming_reconnect_max_attempts: 3
   wyoming_reconnect_delay: 1.0
+  # Audio recording settings
+  audio_recording: false
+  audio_retention_days: 7
+  audio_max_files: 0
 schema:
   frequency: float
   squelch: int(0,200)
@@ -74,3 +78,6 @@ schema:
   wyoming_read_timeout: float
   wyoming_reconnect_max_attempts: int(1,10)
   wyoming_reconnect_delay: float(0.5,10.0)
+  audio_recording: bool
+  audio_retention_days: int(1,365)
+  audio_max_files: int(0,10000)

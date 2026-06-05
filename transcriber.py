@@ -69,6 +69,10 @@ def load_config():
         "min_transmission_duration": 0.3,
         "max_transmission_duration": 120.0,
         "vad_recovery_seconds": 1.0,
+        # Audio recording options
+        "audio_recording": False,
+        "audio_retention_days": 7,
+        "audio_max_files": 0,
     }
 
 
@@ -854,6 +858,9 @@ class _TransmissionState:
         # Audio buffer (for warmup period)
         self.warmup_buffer: bytearray = bytearray()
         
+        # Audio recording buffer (full transmission for WAV storage)
+        self.recording_buffer: bytearray = bytearray()
+        
         # Wyoming streaming
         self.wyoming: _WyomingStreamingClient = _WyomingStreamingClient()
         
@@ -875,8 +882,199 @@ class _TransmissionState:
         self.silence_start = 0.0
         self.end_time = 0.0
         self.warmup_buffer = bytearray()
+        self.recording_buffer = bytearray()
         self.transcript = None
         self.wyoming = _WyomingStreamingClient()
+
+
+def create_wav_header(data_size: int) -> bytes:
+    """Create a minimal WAV header for 16kHz/16-bit/mono PCM data.
+    
+    Args:
+        data_size: Size of the audio data in bytes.
+        
+    Returns:
+        Bytes containing the WAV header.
+    """
+    sample_rate: int = 16000
+    num_channels: int = 1
+    bits_per_sample: int = 16
+    byte_rate: int = sample_rate * num_channels * bits_per_sample // 8
+    block_align: int = num_channels * bits_per_sample // 8
+    
+    header = struct.pack(
+        '<4sI4s4sIHHIIHH4sI',
+        b'RIFF',
+        36 + data_size,
+        b'WAVE',
+        b'fmt ',
+        16,
+        1,  # PCM format
+        num_channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        bits_per_sample,
+        b'data',
+        data_size,
+    )
+    return header
+
+
+AUDIO_SAVE_DIR: str = "/config/www/radio-audio"
+
+
+def save_audio_recording(
+    audio_data: bytes,
+    frequency: str,
+    timestamp_str: str,
+) -> Optional[str]:
+    """Save audio recording as a WAV file.
+    
+    Args:
+        audio_data: Raw PCM16 audio bytes.
+        frequency: The radio frequency as a string (e.g., "155.1075").
+        timestamp_str: ISO-format timestamp string for the filename.
+        
+    Returns:
+        Relative path to the saved file, or None on failure.
+    """
+    try:
+        os.makedirs(AUDIO_SAVE_DIR, exist_ok=True)
+    except OSError as e:
+        logger.error(f"[Audio] Failed to create audio directory {AUDIO_SAVE_DIR}: {e}")
+        return None
+    
+    # Generate filename: YYYYMMDD-HHMMSS-XXXX.XX.wav
+    # Use the timestamp string to derive a sortable name
+    ts_clean = ""
+    freq_safe = str(frequency).replace(".", "_")
+    try:
+        # Parse ISO timestamp to get a clean filename component
+        # Handle formats like "2026-01-25T18:15:00+00:00" or "2026-01-25T18:15:00Z"
+        ts_clean = timestamp_str.replace(":", "").replace("-", "").replace("Z", "").split("+")[0]
+        # Remove trailing fractional digits beyond 6 (microseconds)
+        if "." in ts_clean:
+            ts_clean = ts_clean.split(".")[0]
+        filename = f"{ts_clean}-{freq_safe}.wav"
+    except Exception:
+        # Fallback to epoch-based naming
+        ts_clean = str(int(time.time()))
+        filename = f"{ts_clean}-{freq_safe}.wav"
+    
+    filepath = os.path.join(AUDIO_SAVE_DIR, filename)
+    
+    # Handle potential filename collisions
+    counter = 0
+    while os.path.exists(filepath):
+        counter += 1
+        filepath = os.path.join(AUDIO_SAVE_DIR, f"{ts_clean}-{freq_safe}_{counter}.wav")
+    
+    try:
+        wav_header = create_wav_header(len(audio_data))
+        with open(filepath, "wb") as f:
+            f.write(wav_header)
+            f.write(audio_data)
+        logger.info(f"[Audio] Saved recording: {filepath} ({len(audio_data)} bytes)")
+        return filepath
+    except OSError as e:
+        logger.error(f"[Audio] Failed to save audio file {filepath}: {e}")
+        return None
+
+
+def cleanup_old_recordings(retention_days: int, max_files: int) -> None:
+    """Remove old audio recordings based on retention policy.
+    
+    Args:
+        retention_days: Number of days to keep recordings.
+        max_files: Maximum number of files to keep (0 = unlimited).
+    """
+    if not os.path.isdir(AUDIO_SAVE_DIR):
+        return
+    
+    now = time.time()
+    retention_seconds = retention_days * 86400  # seconds per day
+    files: list[tuple[str, float]] = []
+    
+    try:
+        for filename in os.listdir(AUDIO_SAVE_DIR):
+            if not filename.endswith(".wav"):
+                continue
+            filepath = os.path.join(AUDIO_SAVE_DIR, filename)
+            try:
+                mtime = os.path.getmtime(filepath)
+                files.append((filepath, mtime))
+            except OSError:
+                continue
+    except OSError as e:
+        logger.error(f"[Audio] Failed to list audio directory {AUDIO_SAVE_DIR}: {e}")
+        return
+    
+    if not files:
+        return
+    
+    # Remove files older than retention period
+    removed = 0
+    for filepath, mtime in files:
+        if now - mtime > retention_seconds:
+            try:
+                os.remove(filepath)
+                logger.debug(f"[Audio] Removed old recording: {filepath}")
+                removed += 1
+            except OSError as e:
+                logger.warning(f"[Audio] Failed to remove {filepath}: {e}")
+    
+    if removed:
+        logger.info(f"[Audio] Cleaned up {removed} old recording(s)")
+    
+    # Enforce max files limit if set
+    if max_files <= 0:
+        return
+    
+    # Sort by modification time (oldest first)
+    files.sort(key=lambda x: x[1])
+    
+    while len(files) > max_files:
+        oldest_path, _ = files.pop(0)
+        try:
+            os.remove(oldest_path)
+            logger.debug(f"[Audio] Removed excess recording: {oldest_path}")
+        except OSError as e:
+            logger.warning(f"[Audio] Failed to remove {oldest_path}: {e}")
+
+
+def _save_mqtt_discovery_audio(config, mqtt_client):
+    """Publish Home Assistant MQTT Auto Discovery payload for audio sensor."""
+    unique_id = f"rtl_fm_{str(config['frequency']).replace('.', '_')}_audio"
+    device_name = f"RTL-FM Scanner {config['frequency']}MHz"
+    
+    discovery_topic = f"homeassistant/sensor/{unique_id}/config"
+    discovery_payload = json.dumps({
+        "name": "Radio Audio Recording",
+        "unique_id": f"{unique_id}_audio",
+        "state_topic": config["mqtt_topic"],
+        "value_template": "{{ value_json.timestamp if value_json.audio_file else '' }}",
+        "json_attributes_topic": config["mqtt_topic"],
+        "icon": "mdi:record-rec",
+        "device": {
+            "identifiers": [f"rtl_fm_{str(config['frequency']).replace('.', '_')}"],
+            "name": device_name,
+            "model": "RTL-SDR",
+            "manufacturer": "RTL-FM Transcriber",
+        },
+    })
+    
+    logger.info(
+        f"[MQTT] Publishing audio sensor discovery to topic='{discovery_topic}'"
+    )
+    
+    try:
+        if not is_mqtt_connected(mqtt_client):
+            logger.error("[MQTT] Failed to publish audio discovery — MQTT client is disconnected")
+            return
+        mqtt_client.publish(discovery_topic, discovery_payload, retain=True)
+    except Exception as e:
+        logger.error(f"[MQTT] Audio discovery publish failed: {e}")
 
 
 def is_hallucination(text):
@@ -1299,8 +1497,12 @@ async def capture_loop(config, mqtt_client):
                         wyoming_client = None
                         transmission.reset()
 
-                # Stream audio to Wyoming if actively speaking
+                # Stream audio to Wyoming and record if actively speaking
                 if transmission.state == "STREAMING" and wyoming_client is not None:
+                    # Record audio for playback (if enabled)
+                    if config.get("audio_recording", False):
+                        transmission.recording_buffer.extend(chunk)
+                    
                     try:
                         await transmission.wyoming.send_chunk(chunk)
                     except Exception as e:
@@ -1445,11 +1647,37 @@ async def _end_transmission(transmission: _TransmissionState, config: dict,
     
     clean_text = transcript.strip()
     
+    # Audio recording and MQTT publication
+    audio_file_path: Optional[str] = None
+    audio_file_name: Optional[str] = None
+    
     # Check for hallucinations
     if is_hallucination(clean_text):
         logger.info(f"Filtered hallucination: '{clean_text}'")
     else:
         logger.info(f"Transcription [{transmission.duration:.1f}s]: {clean_text}")
+        
+        # Save audio recording if enabled
+        if config.get("audio_recording", False) and transmission.recording_buffer:
+            timestamp_str = format_timestamp(config.get("timezone", "UTC"))
+            
+            # Combine warmup buffer with recording buffer for complete audio
+            full_audio = bytes(transmission.warmup_buffer) + bytes(transmission.recording_buffer)
+            
+            audio_file_path = save_audio_recording(
+                full_audio,
+                str(config["frequency"]),
+                timestamp_str,
+            )
+            
+            if audio_file_path:
+                audio_file_name = os.path.basename(audio_file_path)
+                
+                # Run retention cleanup
+                cleanup_old_recordings(
+                    config.get("audio_retention_days", 7),
+                    config.get("audio_max_files", 0),
+                )
         
         # Publish to MQTT
         message = {
@@ -1457,6 +1685,12 @@ async def _end_transmission(transmission: _TransmissionState, config: dict,
             "frequency": str(config["frequency"]),
             "timestamp": format_timestamp(config.get("timezone", "UTC")),
         }
+        
+        # Add audio fields if recording is enabled and available
+        if config.get("audio_recording", False) and audio_file_name:
+            message["audio_file"] = f"radio-audio/{audio_file_name}"
+            message["audio_url"] = f"media-source://media_source/local/radio-audio/{audio_file_name}"
+        
         mqtt_topic = config["mqtt_topic"]
         mqtt_payload = json.dumps(message)
         logger.info(
@@ -1592,6 +1826,10 @@ def main():
 
     # Publish HA Discovery
     publish_discovery(config, mqtt_client)
+    
+    # Publish audio sensor discovery if recording is enabled
+    if config.get("audio_recording", False):
+        _save_mqtt_discovery_audio(config, mqtt_client)
 
     # Check Wyoming server connectivity on startup
     wyoming_available = asyncio.run(check_wyoming_connection(config))
