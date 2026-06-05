@@ -1079,21 +1079,39 @@ def _save_mqtt_discovery_audio(config, mqtt_client):
 
 def is_hallucination(text):
     """Check for common Whisper hallucinations on silence."""
-    hallucinations = [
+    # Phrase-based hallucinations
+    phrase_hallucinations = [
         "thank you for watching",
         "thanks for watching",
         "subs by",
         "subscribe",
         "amara.org",
         "copyright",
+        "please subscribe",
+        "like and subscribe",
+        "transcribed by",
+        "subtitles by",
     ]
+    # Single-word hallucinations (only if they are the entire text)
+    single_word_hallucinations = [
+        "you",
+    ]
+    
     text_lower = text.lower().strip()
 
     # Empty or very short
     if len(text_lower) < 2:
         return True
 
-    return any(h in text_lower for h in hallucinations)
+    # Check for phrase-based hallucinations
+    if any(h in text_lower for h in phrase_hallucinations):
+        return True
+        
+    # Check for single-word hallucinations (exact match)
+    if text_lower in single_word_hallucinations:
+        return True
+
+    return False
 
 
 async def _start_pipeline(config, frequency_hz, sample_rate, capture_rate):
