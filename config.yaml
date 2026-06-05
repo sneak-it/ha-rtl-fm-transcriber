@@ -1,5 +1,5 @@
 name: "RTL-FM Transcriber"
-version: "1.3.0"
+version: "1.4.0"
 slug: rtl-fm-transcriber
 description: "Captures FM radio via RTL-SDR, transcribes with Whisper, publishes to MQTT"
 init: false
