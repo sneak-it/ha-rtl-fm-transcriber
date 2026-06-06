@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.4.0
+
+- Added IANA timezone support (`timezone` env var) for localized timestamps in transcriptions and recordings
+- Added streaming segmentation options for finer-grained transmission control:
+  - `silence_timeout`: Time to wait for silence before ending transmission (default: 2.0s)
+  - `vad_warmup_ms`: VAD warmup period in milliseconds (default: 150ms)
+  - `min_transmission_duration`: Minimum duration to consider a transmission valid (default: 0.3s)
+  - `max_transmission_duration`: Maximum transmission duration limit (default: 120.0s)
+  - `vad_recovery_seconds`: Recovery time after voice activity ends (default: 1.0s)
+- Added Wyoming protocol connection settings for tuning stability:
+  - `wyoming_connection_timeout`: Connection timeout in seconds (default: 10.0s)
+  - `wyoming_read_timeout`: Read timeout in seconds (default: 30.0s)
+  - `wyoming_reconnect_max_attempts`: Maximum reconnection attempts (default: 3)
+  - `wyoming_reconnect_delay`: Base reconnection delay in seconds (default: 1.0s)
+- Added optional local audio recording feature:
+  - `audio_recording`: Enable/disable audio recording (default: false)
+  - `audio_retention_days`: Number of days to retain recordings (default: 7)
+  - `audio_max_files`: Maximum number of recordings to keep, 0 for unlimited (default: 0)
+
 ## 1.3.0
 
 - **Critical fix**: Changed rtl_fm sample rate from 48000 Hz to 12000 Hz for narrowband FM (public safety radio)
