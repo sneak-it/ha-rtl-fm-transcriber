@@ -44,7 +44,7 @@ cards:
 
       {% else %}
 
-      {% for entry in history[-10:] | reverse %}
+      {% for entry in history[-5:] | reverse %}
 
       ---
 
@@ -54,11 +54,11 @@ cards:
 
       {{ entry.text | default('No text', true) }}
 
-      {% if entry.audio_file %}
+      {% if entry.audio_file | default(false, true) %}
 
-      <audio controls preload="none">
-      <source src="/local/radio-audio/{{ entry.audio_file | replace('radio-audio/', '') }}" type="audio/wav">
-      Your browser does not support the audio element.
+      <audio controls src="/local/radio-audio/{{ entry.audio_file.split('/') |
+      last }}" type="audio/wav" preload="metadata">
+        Your browser does not support the audio element.
       </audio>
 
       {% endif %}
