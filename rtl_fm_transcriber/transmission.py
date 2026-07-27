@@ -6,8 +6,6 @@ chunk sequences without an RTL-SDR dongle or a Wyoming server.
 
 import time
 
-from .wyoming_client import WyomingStreamingClient
-
 # States
 IDLE = "IDLE"
 WARMUP = "WARMUP"
@@ -97,8 +95,6 @@ class TransmissionState:
         self.warmup_buffer: bytearray = bytearray()
         self.recording_buffer: bytearray = bytearray()
 
-        self.wyoming: WyomingStreamingClient = WyomingStreamingClient()
-        self.transcript: str | None = None
 
     @property
     def duration(self) -> float:
@@ -141,5 +137,3 @@ class TransmissionState:
         self.end_time = None
         self.warmup_buffer = bytearray()
         self.recording_buffer = bytearray()
-        self.transcript = None
-        self.wyoming = WyomingStreamingClient()

@@ -36,29 +36,20 @@ class WyomingStreamingClient:
         self._connection_state: str = self.STATE_DISCONNECTED
 
     def classify_error(self, e: Exception) -> str:
-        """Classify a Wyoming connection error for logging.
-        
-        Returns a string describing the error type:
-        - 'connection_refused': Server is down or port not listening
-        - 'connection_timeout': Connection attempt timed out
-        - 'connection_reset': Connection was reset by peer (server crashed)
-        - 'connection_lost': Connection dropped unexpectedly
-        - 'timeout_waiting_for_response': Server didn't respond in time
-        - 'unknown': Unclassified error
+        """Classify a Wyoming error for logging and reconnect decisions.
+
+        Python maps ETIMEDOUT and ECONNRESET onto TimeoutError and
+        ConnectionResetError, so checking errno for those is unreachable.
         """
         if isinstance(e, ConnectionRefusedError):
             return "connection_refused"
-        elif isinstance(e, asyncio.TimeoutError):
-            return "timeout"
         elif isinstance(e, ConnectionResetError):
             return "connection_reset"
         elif isinstance(e, BrokenPipeError):
             return "connection_lost"
+        elif isinstance(e, TimeoutError):
+            return "timeout"
         elif isinstance(e, OSError):
-            if e.errno == 110:  # ETIMEDOUT
-                return "connection_timeout"
-            elif e.errno == 104:  # ECONNRESET
-                return "connection_reset"
             return f"os_error_{e.errno or 'unknown'}"
         elif "timeout" in str(e).lower():
             return "timeout"
@@ -78,12 +69,13 @@ class WyomingStreamingClient:
         Returns:
             True if connected, False on failure.
         """
+        # Close any previous socket first; otherwise each attempt orphans one.
+        await self.disconnect()
         self._connection_state = self.STATE_CONNECTING
 
         try:
             self.client = AsyncTcpClient(host, port)
-            # Use context manager for proper cleanup
-            await self.client.__aenter__()
+            await asyncio.wait_for(self.client.__aenter__(), timeout)
 
             self._connection_state = self.STATE_CONNECTED
             logger.info(f"[Wyoming] Connected to {host}:{port}")
@@ -144,31 +136,31 @@ class WyomingStreamingClient:
         """
         max_attempts = config.get("wyoming_reconnect_max_attempts", 3)
         base_delay = config.get("wyoming_reconnect_delay", 1.0)
-        
+        conn_timeout = config.get("wyoming_connection_timeout", 10.0)
+
         for attempt in range(1, max_attempts + 1):
-            delay = base_delay * (2 ** (attempt - 1))  # 1s, 2s, 4s...
+            if attempt > 1:
+                # Back off between attempts, but try immediately first.
+                delay = base_delay * (2 ** (attempt - 2))  # 1s, 2s, 4s...
+                logger.info(f"[Wyoming] Waiting {delay:.1f}s before retry")
+                await asyncio.sleep(delay)
+
             self._connection_state = self.STATE_RECONNECTING
             logger.info(
-                f"[Wyoming] Reconnection attempt {attempt}/{max_attempts} "
-                f"in {delay:.1f}s to {host}:{port}"
+                f"[Wyoming] Connection attempt {attempt}/{max_attempts} "
+                f"to {host}:{port}"
             )
-            await asyncio.sleep(delay)
-            
-            if await self.connect(host, port):
-                self._connection_state = self.STATE_CONNECTED
-                logger.info(
-                    f"[Wyoming] Reconnected successfully on attempt {attempt}"
-                )
+            if await self.connect(host, port, timeout=conn_timeout):
+                logger.info(f"[Wyoming] Connected on attempt {attempt}")
                 return True
-            else:
-                logger.warning(
-                    f"[Wyoming] Reconnection attempt {attempt}/{max_attempts} failed"
-                )
-        
+            logger.warning(
+                f"[Wyoming] Connection attempt {attempt}/{max_attempts} failed"
+            )
+
         self._connection_state = self.STATE_DISCONNECTED
         logger.error(
-            f"[Wyoming] All {max_attempts} reconnection attempts failed. "
-            f"Will retry on next transmission."
+            f"[Wyoming] All {max_attempts} connection attempts failed to "
+            f"{host}:{port}"
         )
         return False
     

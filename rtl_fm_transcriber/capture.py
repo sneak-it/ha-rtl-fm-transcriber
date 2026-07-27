@@ -19,7 +19,6 @@ from .transmission import (
     BUFFER,
     END,
     HOLD,
-    IDLE,
     IGNORE,
     PROMOTE,
     START,
@@ -39,6 +38,8 @@ MAX_RETRY_DELAY = 30.0  # seconds
 
 READ_CHUNK_BYTES = 4096
 READ_TIMEOUT = 0.05
+# How long to let in-flight transcriptions finish during pipeline teardown.
+FINALIZER_DRAIN_TIMEOUT = 35.0
 
 
 async def capture_loop(config, mqtt_client):
@@ -84,6 +85,10 @@ async def capture_loop(config, mqtt_client):
         logger.info("Pipeline started. Waiting for audio...")
 
         transmission = TransmissionState(config, warmup_bytes)
+        # Owned here rather than by TransmissionState: on end-of-transmission the
+        # client is handed to a background finalizer, which closes it.
+        wyoming = WyomingStreamingClient()
+        finalizers: set[asyncio.Task] = set()
         pipeline_running = True
         stderr_reader_task = None
 
@@ -104,7 +109,9 @@ async def capture_loop(config, mqtt_client):
                         transmission.state in ACTIVE_STATES
                         and transmission.next_action(False, time.time()) == END
                     ):
-                        await _finish(transmission, config, mqtt_client)
+                        wyoming = await _finish(
+                            transmission, wyoming, config, mqtt_client, finalizers
+                        )
                     continue
                 except asyncio.CancelledError:
                     break
@@ -123,7 +130,9 @@ async def capture_loop(config, mqtt_client):
                     continue
 
                 if action == END:
-                    await _finish(transmission, config, mqtt_client)
+                    wyoming = await _finish(
+                        transmission, wyoming, config, mqtt_client, finalizers
+                    )
                     # A max-duration split lands mid-carrier, so the chunk that
                     # tripped it opens the next transmission rather than being
                     # dropped.
@@ -142,7 +151,8 @@ async def capture_loop(config, mqtt_client):
 
                 if action == PROMOTE:
                     transmission.warmup_buffer.extend(chunk)
-                    if not await _open_session(transmission, config):
+                    if not await _open_session(transmission, wyoming, config):
+                        await wyoming.disconnect()
                         transmission.reset()
                     continue
 
@@ -163,7 +173,8 @@ async def capture_loop(config, mqtt_client):
                 transmission.silence_start = None
                 if config.get("audio_recording", False):
                     transmission.recording_buffer.extend(chunk)
-                if not await _send_chunk(transmission, config, chunk):
+                if not await _send_chunk(wyoming, config, chunk):
+                    await wyoming.disconnect()
                     transmission.reset()
 
         except Exception as e:
@@ -204,7 +215,15 @@ async def capture_loop(config, mqtt_client):
                 f"Pipeline status - RTL_FM: {'exited' if rtl_ret is not None else 'running'}({rtl_ret}), SOX: {'exited' if sox_ret is not None else 'running'}({sox_ret})"
             )
 
-            await transmission.wyoming.disconnect()
+            # Let in-flight transcriptions finish rather than orphaning them.
+            if finalizers:
+                logger.info(f"Waiting for {len(finalizers)} pending transcription(s)")
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        asyncio.gather(*finalizers, return_exceptions=True),
+                        timeout=FINALIZER_DRAIN_TIMEOUT,
+                    )
+            await wyoming.disconnect()
             await cleanup_pipeline(rtl_proc, sox_proc)
 
         # Pipeline failed - decide whether to restart
@@ -222,34 +241,31 @@ async def capture_loop(config, mqtt_client):
         await asyncio.sleep(delay)
 
 
-async def _open_session(transmission: TransmissionState, config: dict) -> bool:
+async def _open_session(
+    transmission: TransmissionState, wyoming: WyomingStreamingClient, config: dict
+) -> bool:
     """Connect to Wyoming, open a session, and flush the warmup buffer.
 
     Runs on every exit from WARMUP, so STREAMING is never entered without a
     session to stream into.
     """
     host, port = parse_wyoming_url(config["whisper_url"])
-    conn_timeout = config.get("wyoming_connection_timeout", 10.0)
 
-    if not transmission.wyoming.is_connected():
-        logger.info(f"[Wyoming] Connecting to {host}:{port}...")
-        connected = await transmission.wyoming.connect(
-            host, port, timeout=conn_timeout
+    if not wyoming.is_connected() and not await wyoming.reconnect_with_backoff(
+        config, host, port
+    ):
+        logger.warning(
+            "[Wyoming] Unable to connect to server. Transmission will be skipped."
         )
-        if not connected and not await transmission.wyoming.reconnect_with_backoff(
-            config, host, port
-        ):
-            logger.warning(
-                "[Wyoming] Unable to connect to server. Transmission will be skipped."
-            )
-            return False
+        return False
 
     try:
-        await transmission.wyoming.start_session(transmission.wyoming.client)
-        await transmission.wyoming.send_chunk(bytes(transmission.warmup_buffer))
+        await wyoming.start_session(wyoming.client)
+        await wyoming.send_chunk(bytes(transmission.warmup_buffer))
     except Exception as e:
-        error_type = transmission.wyoming.classify_error(e)
-        logger.error(f"[Wyoming] Failed to start session ({error_type}): {e}")
+        logger.error(
+            f"[Wyoming] Failed to start session ({wyoming.classify_error(e)}): {e}"
+        )
         return False
 
     transmission.state = STREAMING
@@ -260,14 +276,14 @@ async def _open_session(transmission: TransmissionState, config: dict) -> bool:
 
 
 async def _send_chunk(
-    transmission: TransmissionState, config: dict, chunk: bytes
+    wyoming: WyomingStreamingClient, config: dict, chunk: bytes
 ) -> bool:
     """Stream one chunk, reconnecting once if the connection dropped."""
     try:
-        await transmission.wyoming.send_chunk(chunk)
+        await wyoming.send_chunk(chunk)
         return True
     except Exception as e:
-        error_type = transmission.wyoming.classify_error(e)
+        error_type = wyoming.classify_error(e)
         logger.error(f"[Wyoming] Failed to send chunk ({error_type}): {e}")
 
     if error_type not in ("connection_reset", "connection_lost"):
@@ -275,12 +291,12 @@ async def _send_chunk(
 
     host, port = parse_wyoming_url(config["whisper_url"])
     logger.info("[Wyoming] Connection lost mid-stream, attempting reconnect...")
-    if not await transmission.wyoming.reconnect_with_backoff(config, host, port):
+    if not await wyoming.reconnect_with_backoff(config, host, port):
         logger.error("[Wyoming] Reconnection failed, skipping transmission")
         return False
 
     try:
-        await transmission.wyoming.start_session(transmission.wyoming.client)
+        await wyoming.start_session(wyoming.client)
     except Exception as e:
         logger.error(f"[Wyoming] Failed to restart session after reconnect: {e}")
         return False
@@ -290,148 +306,140 @@ async def _send_chunk(
 
 
 async def _finish(
-    transmission: TransmissionState, config: dict, mqtt_client
-) -> None:
-    """Close out a transmission and return to IDLE."""
+    transmission: TransmissionState,
+    wyoming: WyomingStreamingClient,
+    config: dict,
+    mqtt_client,
+    finalizers: set,
+) -> WyomingStreamingClient:
+    """Detach a finished transmission for transcription and return to IDLE.
+
+    Waiting for a transcript here would stall audio capture for up to
+    wyoming_read_timeout seconds, and the stale chunks read afterwards would be
+    stamped with the wrong wall-clock time, skewing the next transmission's
+    timers. So the transcript wait runs as a background task, which takes
+    ownership of the connection and closes it. Returns a fresh client for the
+    next transmission.
+    """
     transmission.end_time = time.time()
-    if transmission.duration >= transmission.max_duration:
+    duration = transmission.duration
+    if duration >= transmission.max_duration:
         reason = f"max duration ({transmission.max_duration}s)"
     else:
         reason = f"silence timeout ({transmission.silence_timeout}s)"
-    logger.info(
-        f"[VAD] Transmission ended on {reason}, duration {transmission.duration:.1f}s"
-    )
-    await _end_transmission(transmission, config, mqtt_client)
+    logger.info(f"[VAD] Transmission ended on {reason}, duration {duration:.1f}s")
+
+    audio = bytes(transmission.warmup_buffer) + bytes(transmission.recording_buffer)
+    session_open = wyoming.is_active
     transmission.reset()
 
-
-async def _end_transmission(transmission: TransmissionState, config: dict,
-                           mqtt_client) -> None:
-    """Send AudioStop, collect the transcript, publish it to MQTT.
-
-    Args:
-        transmission: The TransmissionState to finalize.
-        config: Configuration dictionary.
-        mqtt_client: MQTT client instance.
-    """
-    if transmission.state not in ACTIVE_STATES:
-        return
-
-    # Check minimum duration
-    if transmission.duration < transmission.min_duration:
+    if duration < transmission.min_duration:
         logger.info(
-            f"[VAD] Transmission too short ({transmission.duration:.2f}s < "
+            f"[VAD] Transmission too short ({duration:.2f}s < "
             f"{transmission.min_duration}s), discarding"
         )
-        transmission.state = IDLE
-        return
+        # Always close: discarding while the session is open leaves the server
+        # holding orphaned audio mid-stream.
+        await wyoming.disconnect()
+        return WyomingStreamingClient()
 
-    # Send AudioStop and get transcript
+    if not session_open:
+        logger.warning("[VAD] Transmission had no Wyoming session, nothing to transcribe")
+        await wyoming.disconnect()
+        return WyomingStreamingClient()
+
+    task = asyncio.create_task(
+        _transcribe_and_publish(wyoming, config, mqtt_client, duration, audio)
+    )
+    finalizers.add(task)
+    task.add_done_callback(finalizers.discard)
+    return WyomingStreamingClient()
+
+
+async def _transcribe_and_publish(
+    wyoming: WyomingStreamingClient,
+    config: dict,
+    mqtt_client,
+    duration: float,
+    audio: bytes,
+) -> None:
+    """Collect the transcript for a finished transmission and publish it.
+
+    Owns `wyoming` and closes it on every path.
+    """
     try:
-        transcript = await transmission.wyoming.stop_session(timeout=30.0)
-    except Exception as e:
-        logger.error(f"[Wyoming] Error ending transmission: {e}")
-        transmission.state = IDLE
-        return
+        read_timeout = config.get("wyoming_read_timeout", 30.0)
+        try:
+            transcript = await wyoming.stop_session(timeout=read_timeout)
+        except Exception as e:
+            logger.error(f"[Wyoming] Error ending transmission: {e}")
+            return
 
-    if not transcript:
-        logger.warning("[VAD] No transcript received for transmission")
-        transmission.state = IDLE
-        return
+        if not transcript:
+            logger.warning("[VAD] No transcript received for transmission")
+            return
 
-    clean_text = transcript.strip()
+        clean_text = transcript.strip()
+        if is_hallucination(clean_text):
+            logger.info(f"Filtered hallucination: '{clean_text}'")
+            return
 
-    # Audio recording and MQTT publication
-    audio_file_path: str | None = None
+        logger.info(f"Transcription [{duration:.1f}s]: {clean_text}")
+        await _publish_transcript(config, mqtt_client, clean_text, audio)
+    finally:
+        await wyoming.disconnect()
+
+
+async def _publish_transcript(
+    config: dict, mqtt_client, clean_text: str, audio: bytes
+) -> None:
+    """Save the recording if enabled and publish the transcript to MQTT."""
     audio_file_name: str | None = None
 
-    # Check for hallucinations
-    if is_hallucination(clean_text):
-        logger.info(f"Filtered hallucination: '{clean_text}'")
-    else:
-        logger.info(f"Transcription [{transmission.duration:.1f}s]: {clean_text}")
-
-        # Save audio recording if enabled
-        if config.get("audio_recording", False) and transmission.recording_buffer:
-            timestamp_str = format_timestamp(config.get("timezone", "UTC"))
-
-            # Combine warmup buffer with recording buffer for complete audio
-            full_audio = bytes(transmission.warmup_buffer) + bytes(transmission.recording_buffer)
-
-            audio_file_path = save_audio_recording(
-                full_audio,
-                str(config["frequency"]),
-                timestamp_str,
+    if config.get("audio_recording", False) and audio:
+        timestamp_str = format_timestamp(config.get("timezone", "UTC"))
+        audio_file_path = await asyncio.to_thread(
+            save_audio_recording, audio, str(config["frequency"]), timestamp_str
+        )
+        if audio_file_path:
+            audio_file_name = os.path.basename(audio_file_path)
+            await asyncio.to_thread(
+                cleanup_old_recordings,
+                config.get("audio_retention_days", 7),
+                config.get("audio_max_files", 0),
             )
 
-            if audio_file_path:
-                audio_file_name = os.path.basename(audio_file_path)
-
-                # Run retention cleanup
-                cleanup_old_recordings(
-                    config.get("audio_retention_days", 7),
-                    config.get("audio_max_files", 0),
-                )
-
-        # Publish to MQTT
-        message = {
-            "text": clean_text,
-            "frequency": str(config["frequency"]),
-            "timestamp": format_timestamp(config.get("timezone", "UTC")),
-        }
-
-        # Add audio fields if recording is enabled and available
-        if config.get("audio_recording", False) and audio_file_name:
-            message["audio_file"] = f"radio-audio/{audio_file_name}"
-            message["audio_url"] = f"media-source://media_source/local/radio-audio/{audio_file_name}"
-
-        safe_publish(
-            mqtt_client, config["mqtt_topic"], json.dumps(message),
-            qos=1, label="transcription",
+    message = {
+        "text": clean_text,
+        "frequency": str(config["frequency"]),
+        "timestamp": format_timestamp(config.get("timezone", "UTC")),
+    }
+    if audio_file_name:
+        message["audio_file"] = f"radio-audio/{audio_file_name}"
+        message["audio_url"] = (
+            f"media-source://media_source/local/radio-audio/{audio_file_name}"
         )
 
-    transmission.state = IDLE
+    safe_publish(
+        mqtt_client, config["mqtt_topic"], json.dumps(message),
+        qos=1, label="transcription",
+    )
 
 
 async def check_wyoming_connection(config: dict) -> bool:
-    """Check Wyoming server connectivity on startup with reconnection retry.
-
-    Args:
-        config: Configuration dictionary.
+    """Probe the Wyoming server at startup.
 
     Returns:
-        True if connected, False after max retries.
+        True if reachable, False after the configured attempts.
     """
-    wyoming_host, wyoming_port = parse_wyoming_url(config["whisper_url"])
-    conn_timeout = config.get("wyoming_connection_timeout", 10.0)
-    max_attempts = config.get("wyoming_reconnect_max_attempts", 3)
-    base_delay = config.get("wyoming_reconnect_delay", 1.0)
-
+    host, port = parse_wyoming_url(config["whisper_url"])
     client = WyomingStreamingClient()
-
-    for attempt in range(1, max_attempts + 1):
-        delay = base_delay * (2 ** (attempt - 1))  # 1s, 2s, 4s...
-        logger.info(
-            f"[Wyoming] Startup connection attempt {attempt}/{max_attempts} "
-            f"in {delay:.1f}s to {wyoming_host}:{wyoming_port}"
-        )
-        await asyncio.sleep(delay)
-
-        connected = await client.connect(wyoming_host, wyoming_port, timeout=conn_timeout)
-        if connected:
-            logger.info(
-                f"[Wyoming] Startup connection successful on attempt {attempt}"
-            )
-            await client.disconnect()
-            return True
-        else:
-            logger.warning(
-                f"[Wyoming] Startup connection attempt {attempt}/{max_attempts} failed"
-            )
+    if await client.reconnect_with_backoff(config, host, port):
+        await client.disconnect()
+        return True
 
     logger.error(
-        f"[Wyoming] All {max_attempts} startup connection attempts failed. "
-        f"The add-on will continue but transcription will not work until "
-        f"the Wyoming server is available."
+        "[Wyoming] Server unreachable at startup. The add-on will continue but "
+        "transcription will not work until the server is available."
     )
     return False
