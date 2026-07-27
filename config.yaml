@@ -19,7 +19,6 @@ map:
 options:
   frequency: 155.1075
   squelch: 50
-  chunk_duration: 15
   whisper_url: "http://youriphere:10300"
   mqtt_host: "core-mosquitto"
   mqtt_port: 1883
@@ -29,7 +28,6 @@ options:
   vad_threshold: 0.03
   vad_baseline_window: 30
   gain: "auto"
-  debug_audio: false
   ppm: 0
   bandpass_filter: true
   bandpass_low: 300
@@ -53,7 +51,6 @@ options:
 schema:
   frequency: float
   squelch: int(0,200)
-  chunk_duration: int(5,60)
   whisper_url: url
   mqtt_host: str
   mqtt_port: int
@@ -63,7 +60,6 @@ schema:
   vad_threshold: float
   vad_baseline_window: int(5,120)
   gain: str?
-  debug_audio: bool
   ppm: int(0,500)
   bandpass_filter: bool
   bandpass_low: int(100,5000)

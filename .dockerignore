@@ -1,3 +1,11 @@
-plans/
+.git/
+.github/
+.gitignore
 .ruff_cache/
 __pycache__/
+*.pyc
+plans/
+home-assistant/
+tests/
+README.md
+CHANGELOG.md

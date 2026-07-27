@@ -18,7 +18,6 @@ Optimized for emergency services (public safety) radio monitoring on VHF (150-17
 |--------|-------------|---------|
 | `frequency` | FM frequency in MHz (e.g. 155.1075) | 155.1075 |
 | `squelch` | Noise threshold (0-200, higher = more selective) | 50 |
-| `chunk_duration` | Maximum transmission duration safety cap (seconds) | 15 |
 | `whisper_url` | Wyoming server URL (e.g. `tcp://host:10300`) | http://10.0.10.21:10300 |
 | `mqtt_host` | MQTT broker hostname | core-mosquitto |
 | `mqtt_port` | MQTT broker port | 1883 |
@@ -32,7 +31,6 @@ Optimized for emergency services (public safety) radio monitoring on VHF (150-17
 | `bandpass_filter` | Enable voice bandpass filter (300-3000 Hz) | true |
 | `bandpass_low` | Bandpass filter low cutoff in Hz | 300 |
 | `bandpass_high` | Bandpass filter high cutoff in Hz | 3000 |
-| `debug_audio` | Save debug audio to /config/www/ | false |
 | `timezone` | Timezone for timestamps (IANA name) | America/New_York |
 | `silence_timeout` | Seconds of silence before transcription is sent | 2.0 |
 | `vad_warmup_ms` | Milliseconds to buffer before streaming (AGC stabilization) | 150 |

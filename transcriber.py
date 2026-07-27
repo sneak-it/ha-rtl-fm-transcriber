@@ -10,12 +10,10 @@ import json
 import logging
 import math
 import os
-import re
 import struct
 import subprocess
 import time
-from datetime import datetime, timezone, timedelta
-from typing import Optional
+from datetime import UTC, datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 import paho.mqtt.client as mqtt
@@ -47,7 +45,6 @@ def load_config():
     return {
         "frequency": 155.1075,
         "squelch": 50,
-        "chunk_duration": 15,
         "whisper_url": "http://youriphere:10300",
         "mqtt_host": "core-mosquitto",
         "mqtt_port": 1883,
@@ -57,7 +54,6 @@ def load_config():
         "vad_threshold": 0.03,
         "vad_baseline_window": 30,
         "gain": "auto",
-        "debug_audio": False,
         "ppm": 0,
         "bandpass_filter": True,
         "bandpass_low": 300,
@@ -92,14 +88,14 @@ def get_timezone_offset(tz_name: str) -> timedelta:
         return timedelta(0)
     
     try:
-        from zoneinfo import ZoneInfo
         from datetime import datetime
+        from zoneinfo import ZoneInfo
         
         # Use a representative date (current date may have different DST)
         # We'll use a dynamic approach below for accuracy
         tz = ZoneInfo(tz_name)
         # Get offset for current moment by creating a naive UTC now and converting
-        now_utc = datetime.now(timezone.utc)
+        now_utc = datetime.now(UTC)
         now_local = now_utc.astimezone(tz)
         return now_local.utcoffset() or timedelta(0)
     except ImportError:
@@ -119,7 +115,7 @@ def format_timestamp(tz_name: str = "UTC") -> str:
     Returns:
         ISO-format timestamp string with timezone offset.
     """
-    now_utc = datetime.now(timezone.utc)
+    now_utc = datetime.now(UTC)
     offset = get_timezone_offset(tz_name)
     tz_info = timezone(offset, name=tz_name)
     local_time = now_utc.astimezone(tz_info)
@@ -213,84 +209,6 @@ def is_mqtt_connected(client):
         return False
 
 
-async def transcribe_wyoming(audio_path, whisper_url, connection_timeout=30):
-    """Send audio file to Wyoming server for transcription.
-
-    Args:
-        audio_path: Path to WAV audio file
-        whisper_url: Wyoming server URL (e.g. tcp://host:10300)
-        connection_timeout: Timeout in seconds for connection and read operations
-    """
-    # Parse host/port from URL
-    try:
-        parsed = urlparse(whisper_url)
-        host = parsed.hostname or "localhost"
-        port = parsed.port or 10300
-    except Exception as e:
-        logger.error(f"Failed to parse Wyoming URL {whisper_url}: {e}")
-        return None
-
-    logger.info(f"Connecting to Wyoming server at {host}:{port}")
-
-    try:
-        async with asyncio.timeout(connection_timeout):
-            async with AsyncTcpClient(host, port) as client:
-                # Read audio file
-                with open(audio_path, "rb") as f:
-                    audio_data = f.read()
-
-                # 1. Send AudioStart (for 16kHz, 16-bit mono, usually expected by Whisper)
-                await client.write_event(
-                    AudioStart(rate=16000, width=2, channels=1).event()
-                )
-
-                # 2. Send AudioChunk(s)
-                chunk_size = 1024
-                for i in range(0, len(audio_data), chunk_size):
-                    chunk = audio_data[i : i + chunk_size]
-                    await client.write_event(
-                        AudioChunk(rate=16000, width=2, channels=1, audio=chunk).event()
-                    )
-
-                # 3. Send AudioStop
-                await client.write_event(AudioStop().event())
-
-                # 4. Send Transcribe event to trigger processing
-                await client.write_event(Transcribe().event())
-
-                # 5. Wait for Transcript
-                logger.info("Waiting for transcript...")
-                while True:
-                    try:
-                        event = await asyncio.wait_for(
-                            client.read_event(), timeout=connection_timeout
-                        )
-                    except asyncio.TimeoutError:
-                        logger.warning(
-                            f"No transcript received within {connection_timeout}s timeout"
-                        )
-                        break
-
-                    if event is None:
-                        logger.warning("Connection closed by server")
-                        break
-
-                    if Transcript.is_type(event.type):
-                        transcript = Transcript.from_event(event)
-                        return transcript.text
-
-    except asyncio.TimeoutError:
-        logger.error(
-            f"Timed out after {connection_timeout}s connecting to or communicating with Wyoming server at {host}:{port}"
-        )
-    except ConnectionRefusedError:
-        logger.error(f"Connection refused to Wyoming server at {host}:{port}")
-    except Exception as e:
-        logger.error(f"Wyoming transcription error: {e}")
-
-    return None
-
-
 def compute_rms(raw_bytes: bytes) -> float:
     """Calculate RMS amplitude from raw PCM16 bytes.
     
@@ -317,30 +235,6 @@ def compute_rms(raw_bytes: bytes) -> float:
     return math.sqrt(sum_squares / num_samples) / 32768.0
 
 
-def compute_rms_batch(raw_bytes: bytes, window_size: int = 1600) -> list[tuple[float, float]]:
-    """Calculate RMS amplitude for overlapping windows of audio data.
-    
-    Args:
-        raw_bytes: Raw PCM16 audio data.
-        window_size: Number of samples per window (default 1600 = 100ms at 16kHz).
-        
-    Returns:
-        List of (start_offset, rms) tuples for each window.
-    """
-    if len(raw_bytes) == 0:
-        return []
-    
-    samples_per_byte = 2  # 16-bit = 2 bytes per sample
-    windows = []
-    
-    for i in range(0, len(raw_bytes) - window_size * samples_per_byte + 1, window_size * samples_per_byte):
-        chunk = raw_bytes[i:i + window_size * samples_per_byte]
-        rms = compute_rms(chunk)
-        windows.append((i / samples_per_byte, rms))
-    
-    return windows
-
-
 class _RmsBaselineTracker:
     """Tracks RMS baseline for RTL-SDR VAD with inverted RMS behavior.
     
@@ -358,7 +252,7 @@ class _RmsBaselineTracker:
         """
         self._samples: list[tuple[float, float]] = []
         self._window_seconds: int = window_seconds
-        self._initial_baseline: Optional[float] = None
+        self._initial_baseline: float | None = None
     
     def add_sample(self, rms, timestamp=None):
         """Add an RMS sample to the baseline.
@@ -417,126 +311,6 @@ class _RmsBaselineTracker:
         return len(self._samples)
 
 
-def check_audio_has_voice(wav_path: str, threshold: float = 0.02,
-                          baseline_tracker: Optional[_RmsBaselineTracker] = None,
-                          baseline_window: int = 30) -> bool:
-    """
-    Voice activity detection using audio amplitude with baseline tracking.
-    
-    In RTL-SDR setups with AGC, idle noise often has HIGHER RMS than
-    active transmissions. When a strong signal arrives, AGC reduces gain,
-    causing the RMS to drop. This function detects voice when RMS drops
-    significantly below a rolling baseline of idle noise.
-
-    Args:
-        wav_path: Path to WAV file to analyze
-        threshold: RMS drop below baseline to detect voice
-        baseline_tracker: Optional _RmsBaselineTracker instance for tracking idle RMS
-        baseline_window: Seconds of idle samples to keep for baseline
-
-    Returns:
-        True if audio likely contains voice, False otherwise.
-        Returns False on failure (safe default to avoid transcribing silence).
-    """
-    try:
-        # Use sox to get audio statistics
-        result = subprocess.run(
-            ["sox", wav_path, "-n", "stat"], capture_output=True, text=True, timeout=10
-        )
-
-        if result.returncode != 0:
-            logger.error(
-                f"sox VAD check failed with return code {result.returncode}: {result.stderr.strip()}"
-            )
-            return False
-
-        # Parse RMS amplitude from sox stat output
-        # sox stat outputs RMS amplitude in multiple formats across versions
-        # We try multiple parsing strategies for robustness
-        rms_found = False
-        combined_output = result.stderr + "\n" + result.stdout
-
-        for line in combined_output.split("\n"):
-            line = line.strip()
-            # Match lines like: "RMS amplitude: 0.1234567"
-            if "RMS" in line and "amplitude" in line:
-                # Try to find a float value in the line
-                numbers = re.findall(r"[\d.]+", line)
-                if numbers:
-                    try:
-                        rms = float(numbers[-1])
-                        rms_found = True
-                        return _check_voice(rms, threshold, baseline_tracker, baseline_window)
-                    except ValueError:
-                        logger.warning(
-                            f"Could not parse RMS value from sox output: {line}"
-                        )
-
-        # If we can't parse, assume silence to be safe
-        if not rms_found:
-            logger.warning(
-                "Could not parse VAD stats from sox output. "
-                "Audio will be treated as silence to avoid transcribing noise. "
-                "Consider adjusting vad_threshold or checking sox installation."
-            )
-        return False
-
-    except subprocess.TimeoutExpired:
-        logger.error("VAD check timed out after 10s")
-        return False
-    except FileNotFoundError:
-        logger.error(
-            "sox command not found - VAD check skipped. Install sox to enable voice activity detection."
-        )
-        return False
-    except Exception as e:
-        logger.warning(f"VAD check failed unexpectedly: {e}")
-        return False
-
-
-def _check_voice(rms: float, threshold: float,
-                 baseline_tracker: Optional[_RmsBaselineTracker],
-                 baseline_window: int) -> bool:
-    """Check if RMS indicates voice using baseline tracking.
-    
-    In RTL-SDR setups with AGC, idle noise often has HIGHER RMS than
-    active transmissions. When a strong signal arrives, AGC reduces gain,
-    causing the RMS to drop.
-
-    Args:
-        rms: Measured RMS amplitude
-        threshold: RMS drop margin below baseline for voice detection
-        baseline_tracker: _RmsBaselineTracker instance for tracking idle RMS
-        baseline_window: Seconds of idle samples to keep for baseline
-
-    Returns:
-        True if RMS drops significantly below baseline (voice detected).
-    """
-    if baseline_tracker is None:
-        baseline_tracker = _RmsBaselineTracker(baseline_window)
-
-    current_time = time.time()
-    baseline = baseline_tracker.get_baseline(current_time)
-
-    if baseline is None:
-        # First sample - store as initial baseline
-        baseline_tracker.add_sample(rms, current_time)
-        logger.info(f"Audio RMS: {rms} (Initial baseline set)")
-        return rms < 0.005  # Near-silence threshold
-
-    logger.info(f"Audio RMS: {rms} (Baseline: {baseline:.4f}, Threshold drop: {threshold})")
-
-    # Voice detected when RMS drops below baseline by the threshold amount
-    voice_detected = rms < (baseline - threshold)
-
-    # Only add to baseline if this sample is consistent with idle (noise)
-    # Don't add transmission samples to the baseline
-    if not voice_detected:
-        baseline_tracker.add_sample(rms, current_time)
-
-    return voice_detected
-
-
 class _WyomingStreamingClient:
     """Manages streaming ASR connection to Wyoming server.
     
@@ -556,14 +330,12 @@ class _WyomingStreamingClient:
     
     def __init__(self) -> None:
         """Initialize the streaming client."""
-        self.client: Optional[AsyncTcpClient] = None
+        self.client: AsyncTcpClient | None = None
         self.transcript_parts: list[str] = []
-        self.final_transcript: Optional[str] = None
+        self.final_transcript: str | None = None
         self._session_active: bool = False
         self._connection_state: str = self.STATE_DISCONNECTED
-        self._last_error: Optional[str] = None
-        self._last_error_time: float = 0.0
-    
+
     def _classify_error(self, e: Exception) -> str:
         """Classify a Wyoming connection error for logging.
         
@@ -608,37 +380,30 @@ class _WyomingStreamingClient:
             True if connected, False on failure.
         """
         self._connection_state = self.STATE_CONNECTING
-        self._last_error = None
-        self._last_error_time = time.time()
-        
+
         try:
             self.client = AsyncTcpClient(host, port)
             # Use context manager for proper cleanup
             await self.client.__aenter__()
-            
+
             self._connection_state = self.STATE_CONNECTED
-            self._last_error = None
             logger.info(f"[Wyoming] Connected to {host}:{port}")
             return True
-            
-        except asyncio.TimeoutError:
+
+        except TimeoutError:
             self._connection_state = self.STATE_DISCONNECTED
-            self._last_error = "connection_timeout"
             logger.error(f"[Wyoming] Connection to {host}:{port} timed out after {timeout}s")
             return False
         except ConnectionRefusedError:
             self._connection_state = self.STATE_DISCONNECTED
-            self._last_error = "connection_refused"
             logger.error(f"[Wyoming] Connection to {host}:{port} refused (server down?)")
             return False
         except OSError as e:
             self._connection_state = self.STATE_DISCONNECTED
-            self._last_error = f"os_error_{e.errno or 'unknown'}"
             logger.error(f"[Wyoming] OS error connecting to {host}:{port}: {e}")
             return False
         except Exception as e:
             self._connection_state = self.STATE_DISCONNECTED
-            self._last_error = f"unknown_{type(e).__name__}"
             logger.error(f"[Wyoming] Unexpected error connecting to {host}:{port}: {e}")
             return False
     
@@ -709,7 +474,7 @@ class _WyomingStreamingClient:
         return False
     
     async def start_session(
-        self, client: AsyncTcpClient, language: Optional[str] = None
+        self, client: AsyncTcpClient, language: str | None = None
     ) -> None:
         """Send transcribe and AudioStart events to begin a transcription session.
         
@@ -755,7 +520,7 @@ class _WyomingStreamingClient:
                 AudioChunk(rate=16000, width=2, channels=1, audio=chunk).event()
             )
     
-    async def stop_session(self, timeout: float = 30.0) -> Optional[str]:
+    async def stop_session(self, timeout: float = 30.0) -> str | None:
         """Send AudioStop and wait for the final transcript.
         
         Args:
@@ -779,7 +544,7 @@ class _WyomingStreamingClient:
                     event = await asyncio.wait_for(
                         self.client.read_event(), timeout=timeout
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     logger.warning(
                         f"[Wyoming] No transcript received within {timeout}s"
                     )
@@ -812,23 +577,16 @@ class _WyomingStreamingClient:
     def is_active(self) -> bool:
         """Check if a session is currently active."""
         return self._session_active
-    
-    @property
-    def connection_state(self) -> str:
-        """Current Wyoming connection state."""
-        return self._connection_state
 
 
 class _TransmissionState:
     """Tracks state of a streaming radio transmission.
-    
+
     States:
         IDLE: No active transmission
         WARMUP: Voice detected, buffering audio (AGC stabilization)
         STREAMING: Actively streaming audio to Wyoming
-        SILENCE_DETECTED: Voice stopped, waiting for silence timeout
-        WAITING_FOR_END: Silence timeout elapsed, about to end transmission
-        TRANSCRIBING: Sent AudioStop, waiting for transcript
+        WAITING_FOR_END: Voice stopped, waiting for the silence timeout
     """
     
     def __init__(self, config: dict, baseline_tracker: _RmsBaselineTracker) -> None:
@@ -842,7 +600,6 @@ class _TransmissionState:
         self.baseline_tracker = baseline_tracker
         
         # Timing parameters
-        self.silence_timeout = config.get("vad_recovery_seconds", 1.0)
         self.silence_recovery = config.get("silence_timeout", 2.0)
         self.min_duration = config.get("min_transmission_duration", 0.3)
         self.max_duration = config.get("max_transmission_duration", 120.0)
@@ -865,7 +622,7 @@ class _TransmissionState:
         self.wyoming: _WyomingStreamingClient = _WyomingStreamingClient()
         
         # Transcript result
-        self.transcript: Optional[str] = None
+        self.transcript: str | None = None
     
     @property
     def duration(self) -> float:
@@ -928,7 +685,7 @@ def save_audio_recording(
     audio_data: bytes,
     frequency: str,
     timestamp_str: str,
-) -> Optional[str]:
+) -> str | None:
     """Save audio recording as a WAV file.
     
     Args:
@@ -1108,10 +865,7 @@ def is_hallucination(text):
         return True
         
     # Check for single-word hallucinations (exact match)
-    if text_lower in single_word_hallucinations:
-        return True
-
-    return False
+    return text_lower in single_word_hallucinations
 
 
 async def _start_pipeline(config, frequency_hz, sample_rate, capture_rate):
@@ -1235,7 +989,7 @@ async def _start_pipeline(config, frequency_hz, sample_rate, capture_rate):
             _pipe_streams(rtl_proc.stdout, sox_proc.stdin)
         )
         # Store the task on the pipeline so it can be awaited during cleanup
-        sox_proc._pipe_task = _pipe_task  # noqa: SLF001
+        sox_proc._pipe_task = _pipe_task
 
         return rtl_proc, sox_proc
     except (OSError, FileNotFoundError) as e:
@@ -1277,7 +1031,7 @@ async def _cleanup_pipeline(rtl_proc, sox_proc):
     if pipe_task is not None and not pipe_task.done():
         try:
             await asyncio.wait_for(pipe_task, timeout=10.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("Pipe task did not finish within timeout")
         except Exception:
             logger.debug("Pipe task finished with error (expected on stop)")
@@ -1290,7 +1044,7 @@ async def _cleanup_pipeline(rtl_proc, sox_proc):
                     proc.terminate()
                     try:
                         await asyncio.wait_for(proc.wait(), timeout=5.0)
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         logger.warning(
                             f"{name} did not terminate gracefully, forcing kill"
                         )
@@ -1306,7 +1060,7 @@ async def capture_loop(config, mqtt_client):
     """Async capture loop with persistent pipeline and streaming transcription.
 
     Implements a state machine for radio transmission segmentation:
-    IDLE → WARMUP → STREAMING → SILENCE_DETECTED → WAITING_FOR_END → TRANSCRIBING → IDLE
+    IDLE -> WARMUP -> STREAMING -> WAITING_FOR_END -> IDLE
     
     Audio is streamed directly to Wyoming as it arrives, with VAD driving
     real-time segmentation based on RMS amplitude drops below baseline.
@@ -1359,7 +1113,7 @@ async def capture_loop(config, mqtt_client):
         warmup_bytes = int(config.get("vad_warmup_ms", 150) / 1000.0 * bytes_per_sec)
 
         # Wyoming connection pool - one connection per pipeline lifetime
-        wyoming_client: Optional[AsyncTcpClient] = None
+        wyoming_client: AsyncTcpClient | None = None
 
         try:
             # Start concurrent stderr reader
@@ -1374,19 +1128,17 @@ async def capture_loop(config, mqtt_client):
                     chunk = await asyncio.wait_for(
                         sox_proc.stdout.read(4096), timeout=0.05
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # No data available - check pipeline health
-                    if transmission.state == "STREAMING" or transmission.state == "WAITING_FOR_END":
-                        # Check if silence timeout elapsed while streaming
-                        if transmission.silence_start > 0:
+                    if (transmission.state in ("STREAMING", "WAITING_FOR_END")
+                            and transmission.silence_start > 0):
                             elapsed = time.time() - transmission.silence_start
                             if elapsed >= transmission.silence_recovery:
                                 logger.info(
                                     f"[VAD] Silence timeout ({transmission.silence_recovery}s) reached, "
                                     f"ending transmission (duration: {transmission.duration:.1f}s)"
                                 )
-                                await _end_transmission(transmission, config, mqtt_client,
-                                                       wyoming_client)
+                                await _end_transmission(transmission, config, mqtt_client)
                                 wyoming_client = None
                                 transmission.reset()
                     await asyncio.sleep(0.01)
@@ -1498,20 +1250,18 @@ async def capture_loop(config, mqtt_client):
                                 f"[VAD] Max transmission duration ({transmission.max_duration}s) "
                                 f"reached, ending transmission"
                             )
-                            await _end_transmission(transmission, config, mqtt_client,
-                                                   wyoming_client)
+                            await _end_transmission(transmission, config, mqtt_client)
                             wyoming_client = None
                             transmission.reset()
 
                 # In WAITING_FOR_END state, check if silence timeout elapsed
-                if transmission.state == "WAITING_FOR_END":
-                    if current_time - transmission.silence_start >= transmission.silence_recovery:
+                if (transmission.state == "WAITING_FOR_END"
+                        and current_time - transmission.silence_start >= transmission.silence_recovery):
                         logger.info(
                             f"[VAD] Silence timeout ({transmission.silence_recovery}s) reached, "
                             f"ending transmission (duration: {transmission.duration:.1f}s)"
                         )
-                        await _end_transmission(transmission, config, mqtt_client,
-                                               wyoming_client)
+                        await _end_transmission(transmission, config, mqtt_client)
                         wyoming_client = None
                         transmission.reset()
 
@@ -1629,14 +1379,13 @@ async def capture_loop(config, mqtt_client):
 
 
 async def _end_transmission(transmission: _TransmissionState, config: dict,
-                           mqtt_client, wyoming_client) -> None:
+                           mqtt_client) -> None:
     """End a transmission: send AudioStop, get transcript, publish to MQTT.
     
     Args:
         transmission: The _TransmissionState to finalize.
         config: Configuration dictionary.
         mqtt_client: MQTT client instance.
-        wyoming_client: The Wyoming streaming client (may be None on error).
     """
     if transmission.state not in ("WARMUP", "STREAMING", "WAITING_FOR_END"):
         return
@@ -1666,8 +1415,8 @@ async def _end_transmission(transmission: _TransmissionState, config: dict,
     clean_text = transcript.strip()
     
     # Audio recording and MQTT publication
-    audio_file_path: Optional[str] = None
-    audio_file_name: Optional[str] = None
+    audio_file_path: str | None = None
+    audio_file_name: str | None = None
     
     # Check for hallucinations
     if is_hallucination(clean_text):
@@ -1834,7 +1583,7 @@ def main():
 
     # Check RTL-SDR
     try:
-        subprocess.run(["rtl_test", "-t"], capture_output=True, timeout=10)
+        subprocess.run(["rtl_test", "-t"], capture_output=True, timeout=10, check=False)
         logger.info("RTL-SDR device check passed")
     except Exception as e:
         logger.error(f"RTL-SDR check failed: {e}")
