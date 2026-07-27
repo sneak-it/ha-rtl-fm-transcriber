@@ -40,17 +40,12 @@ READ_CHUNK_BYTES = 4096
 READ_TIMEOUT = 0.05
 # How long to let in-flight transcriptions finish during pipeline teardown.
 FINALIZER_DRAIN_TIMEOUT = 35.0
+# A pipeline must run at least this long to count as healthy for backoff.
+HEALTHY_RUNTIME = 30.0
 
 
 async def capture_loop(config, mqtt_client):
-    """Capture audio continuously, segment it into transmissions, transcribe each.
-
-    One rtl_fm -> sox pipeline runs for as long as it stays healthy. Every chunk
-    read from it goes through the transition table in `transmission`, which
-    yields exactly one action, so each chunk is dispatched exactly once.
-
-    Restarts the pipeline with exponential backoff on failure.
-    """
+    """Supervise the capture pipeline, restarting it with backoff on failure."""
     frequency_hz = int(config["frequency"] * 1_000_000)
     sample_rate = 16000
     # 12000 Hz sample rate for narrowband FM (12.5 kHz public safety channels)
@@ -72,173 +67,164 @@ async def capture_loop(config, mqtt_client):
         processes = await start_pipeline(
             config, frequency_hz, sample_rate, capture_rate
         )
+
         if processes is None:
-            retry_count += 1
-            delay = min(INITIAL_RETRY_DELAY * (2 ** (retry_count - 1)), MAX_RETRY_DELAY)
-            logger.error(f"Failed to start audio pipeline, retrying in {delay:.1f}s")
-            await asyncio.sleep(delay)
-            continue
-
-        rtl_proc, sox_proc = processes
-        retry_count = 0  # Reset on successful start
-
-        logger.info("Pipeline started. Waiting for audio...")
-
-        transmission = TransmissionState(config, warmup_bytes)
-        # Owned here rather than by TransmissionState: on end-of-transmission the
-        # client is handed to a background finalizer, which closes it.
-        wyoming = WyomingStreamingClient()
-        finalizers: set[asyncio.Task] = set()
-        pipeline_running = True
-        stderr_reader_task = None
-
-        try:
-            stderr_reader_task = asyncio.create_task(
-                read_stderr_pipeline(rtl_proc, sox_proc)
+            ran_for = 0.0
+        else:
+            rtl_proc, sox_proc = processes
+            logger.info("Pipeline started. Waiting for audio...")
+            started = time.monotonic()
+            try:
+                await _run_pipeline(
+                    rtl_proc, sox_proc, config, mqtt_client, warmup_bytes
+                )
+            except asyncio.CancelledError:
+                await cleanup_pipeline(rtl_proc, sox_proc)
+                raise
+            except Exception as e:
+                logger.error(f"Capture loop error: {e}")
+            finally:
+                ran_for = time.monotonic() - started
+            logger.error(
+                f"Pipeline status - RTL_FM: {_proc_status(rtl_proc)}, "
+                f"SOX: {_proc_status(sox_proc)}"
             )
+            await cleanup_pipeline(rtl_proc, sox_proc)
 
-            while pipeline_running:
-                try:
-                    chunk = await asyncio.wait_for(
-                        sox_proc.stdout.read(READ_CHUNK_BYTES), timeout=READ_TIMEOUT
-                    )
-                except TimeoutError:
-                    # No data available. The same transition table decides, but
-                    # only END is actionable with no chunk to dispatch.
-                    if (
-                        transmission.state in ACTIVE_STATES
-                        and transmission.next_action(False, time.time()) == END
-                    ):
-                        wyoming = await _finish(
-                            transmission, wyoming, config, mqtt_client, finalizers
-                        )
-                    continue
-                except asyncio.CancelledError:
-                    break
+        # Only a pipeline that actually ran counts as healthy. Resetting on a
+        # successful spawn instead meant a missing or claimed dongle, where
+        # rtl_fm launches fine and exits immediately, looped at 1s forever and
+        # never reached the backoff.
+        if ran_for >= HEALTHY_RUNTIME:
+            logger.info(f"Pipeline ran {ran_for:.0f}s before failing, resetting backoff")
+            retry_count = 0
 
-                if not chunk:
-                    # EOF from sox - pipeline broke
-                    logger.error("Audio pipeline died (EOF from sox)")
-                    pipeline_running = False
-                    break
+        retry_count += 1
+        if retry_count > MAX_PIPELINE_RETRIES:
+            logger.error(
+                f"Audio pipeline failed {MAX_PIPELINE_RETRIES} times without "
+                f"running for {HEALTHY_RUNTIME:.0f}s. Giving up. Check that the "
+                f"RTL-SDR dongle is connected and not claimed by another process."
+            )
+            return
 
-                now = time.time()
-                voice = is_voice(compute_rms(chunk))
-                action = transmission.next_action(voice, now, incoming=len(chunk))
+        delay = min(INITIAL_RETRY_DELAY * (2 ** (retry_count - 1)), MAX_RETRY_DELAY)
+        logger.warning(
+            f"Restarting pipeline in {delay:.1f}s "
+            f"(attempt {retry_count}/{MAX_PIPELINE_RETRIES})"
+        )
+        await asyncio.sleep(delay)
 
-                if action == IGNORE:
-                    continue
 
-                if action == END:
+def _proc_status(proc) -> str:
+    """Short description of a subprocess's exit state, for diagnostics."""
+    rc = proc.returncode
+    return f"exited({rc})" if rc is not None else "running"
+
+
+async def _run_pipeline(rtl_proc, sox_proc, config, mqtt_client, warmup_bytes):
+    """Read and segment audio until the pipeline dies.
+
+    Every chunk goes through the transition table in `transmission`, which yields
+    exactly one action, so no chunk is dropped or dispatched twice.
+    """
+    transmission = TransmissionState(config, warmup_bytes)
+    # Owned here rather than by TransmissionState: at end of transmission the
+    # client is handed to a background finalizer, which closes it.
+    wyoming = WyomingStreamingClient()
+    finalizers: set[asyncio.Task] = set()
+    stderr_task = asyncio.create_task(read_stderr_pipeline(rtl_proc, sox_proc))
+
+    try:
+        while True:
+            try:
+                chunk = await asyncio.wait_for(
+                    sox_proc.stdout.read(READ_CHUNK_BYTES), timeout=READ_TIMEOUT
+                )
+            except TimeoutError:
+                # No data available. The same transition table decides, but only
+                # END is actionable with no chunk to dispatch.
+                if (
+                    transmission.state in ACTIVE_STATES
+                    and transmission.next_action(False, time.time()) == END
+                ):
                     wyoming = await _finish(
                         transmission, wyoming, config, mqtt_client, finalizers
                     )
-                    # A max-duration split lands mid-carrier, so the chunk that
-                    # tripped it opens the next transmission rather than being
-                    # dropped.
-                    if voice:
-                        transmission.begin(chunk, now)
-                    continue
+                continue
 
-                if action == START:
-                    logger.info("[VAD] Transmission started (squelch open)")
+            if not chunk:
+                logger.error("Audio pipeline died (EOF from sox)")
+                return
+
+            now = time.time()
+            voice = is_voice(compute_rms(chunk))
+            action = transmission.next_action(voice, now, incoming=len(chunk))
+
+            if action == IGNORE:
+                continue
+
+            if action == END:
+                wyoming = await _finish(
+                    transmission, wyoming, config, mqtt_client, finalizers
+                )
+                # A max-duration split lands mid-carrier, so the chunk that
+                # tripped it opens the next transmission rather than being
+                # dropped.
+                if voice:
                     transmission.begin(chunk, now)
-                    continue
+                continue
 
-                if action == BUFFER:
-                    transmission.warmup_buffer.extend(chunk)
-                    continue
+            if action == START:
+                logger.info("[VAD] Transmission started (squelch open)")
+                transmission.begin(chunk, now)
+                continue
 
-                if action == PROMOTE:
-                    transmission.warmup_buffer.extend(chunk)
-                    if not await _open_session(transmission, wyoming, config):
-                        await wyoming.disconnect()
-                        transmission.reset()
-                    continue
+            if action == BUFFER:
+                transmission.warmup_buffer.extend(chunk)
+                continue
 
-                if action == HOLD:
-                    if transmission.silence_start is None:
-                        transmission.silence_start = now
-                        transmission.state = WAITING_FOR_END
-                        logger.debug(
-                            "[VAD] Silence detected, ending in "
-                            f"{transmission.silence_timeout}s unless voice resumes"
-                        )
-                    continue
-
-                # STREAM: voice, with a session already open
-                if transmission.state == WAITING_FOR_END:
-                    logger.debug("[VAD] Voice resumed inside the silence window")
-                transmission.state = STREAMING
-                transmission.silence_start = None
-                if config.get("audio_recording", False):
-                    transmission.recording_buffer.extend(chunk)
-                if not await _send_chunk(wyoming, config, chunk):
+            if action == PROMOTE:
+                transmission.warmup_buffer.extend(chunk)
+                if not await _open_session(transmission, wyoming, config):
                     await wyoming.disconnect()
                     transmission.reset()
+                continue
 
-        except Exception as e:
-            logger.error(f"Capture loop error: {e}")
-        finally:
-            pipeline_running = False
-            # Collect any remaining stderr before cleanup
-            if stderr_reader_task:
-                stderr_reader_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await stderr_reader_task
-
-            # Dump any remaining stderr for diagnostics
-            try:
-                if rtl_proc.returncode is not None or rtl_proc.stderr:
-                    remaining = await rtl_proc.stderr.read()
-                    if remaining:
-                        logger.error(
-                            f"RTL_FM final stderr: {remaining.decode('utf-8', errors='replace').strip()}"
-                        )
-            except (Exception, AttributeError):
-                pass
-
-            try:
-                if sox_proc.returncode is not None or sox_proc.stderr:
-                    remaining = await sox_proc.stderr.read()
-                    if remaining:
-                        logger.error(
-                            f"SOX final stderr: {remaining.decode('utf-8', errors='replace').strip()}"
-                        )
-            except (Exception, AttributeError):
-                pass
-
-            # Check return codes for diagnostics
-            rtl_ret = rtl_proc.returncode
-            sox_ret = sox_proc.returncode
-            logger.error(
-                f"Pipeline status - RTL_FM: {'exited' if rtl_ret is not None else 'running'}({rtl_ret}), SOX: {'exited' if sox_ret is not None else 'running'}({sox_ret})"
-            )
-
-            # Let in-flight transcriptions finish rather than orphaning them.
-            if finalizers:
-                logger.info(f"Waiting for {len(finalizers)} pending transcription(s)")
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(
-                        asyncio.gather(*finalizers, return_exceptions=True),
-                        timeout=FINALIZER_DRAIN_TIMEOUT,
+            if action == HOLD:
+                if transmission.silence_start is None:
+                    transmission.silence_start = now
+                    transmission.state = WAITING_FOR_END
+                    logger.debug(
+                        "[VAD] Silence detected, ending in "
+                        f"{transmission.silence_timeout}s unless voice resumes"
                     )
-            await wyoming.disconnect()
-            await cleanup_pipeline(rtl_proc, sox_proc)
+                continue
 
-        # Pipeline failed - decide whether to restart
-        if retry_count >= MAX_PIPELINE_RETRIES:
-            logger.error(
-                f"Max pipeline retries ({MAX_PIPELINE_RETRIES}) reached. Stopping."
-            )
-            break
+            # STREAM: voice, with a session already open
+            if transmission.state == WAITING_FOR_END:
+                logger.debug("[VAD] Voice resumed inside the silence window")
+            transmission.state = STREAMING
+            transmission.silence_start = None
+            if config.get("audio_recording", False):
+                transmission.recording_buffer.extend(chunk)
+            if not await _send_chunk(wyoming, config, chunk):
+                await wyoming.disconnect()
+                transmission.reset()
+    finally:
+        stderr_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await stderr_task
 
-        retry_count += 1
-        delay = min(INITIAL_RETRY_DELAY * (2 ** (retry_count - 1)), MAX_RETRY_DELAY)
-        logger.warning(
-            f"Pipeline failed. Restarting in {delay:.1f}s (attempt {retry_count}/{MAX_PIPELINE_RETRIES})..."
-        )
-        await asyncio.sleep(delay)
+        # Let in-flight transcriptions finish rather than orphaning them.
+        if finalizers:
+            logger.info(f"Waiting for {len(finalizers)} pending transcription(s)")
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(
+                    asyncio.gather(*finalizers, return_exceptions=True),
+                    timeout=FINALIZER_DRAIN_TIMEOUT,
+                )
+        await wyoming.disconnect()
 
 
 async def _open_session(

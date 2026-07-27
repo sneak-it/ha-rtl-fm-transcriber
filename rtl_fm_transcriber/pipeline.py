@@ -6,6 +6,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+PROC_TERM_TIMEOUT = 5.0
+PIPE_TASK_TIMEOUT = 2.0
+
 
 async def start_pipeline(config, frequency_hz, sample_rate, capture_rate):
     """Start the rtl_fm -> sox audio capture pipeline using asyncio subprocess.
@@ -109,13 +112,16 @@ async def start_pipeline(config, frequency_hz, sample_rate, capture_rate):
 
         # Background task: pipe rtl_fm stdout -> sox stdin asynchronously
         async def _pipe_streams(reader, writer):
-            """Copy all data from reader to writer until EOF."""
+            """Copy all data from reader to writer until EOF, with backpressure."""
             try:
                 while True:
                     chunk = await reader.read(65536)  # 64 KiB chunks
                     if not chunk:
                         break
                     writer.write(chunk)
+                    # Without this, a stalled sox lets rtl_fm output pile up in
+                    # memory unbounded.
+                    await writer.drain()
                 writer.close()
                 await writer.wait_closed()
             except (asyncio.CancelledError, Exception):
@@ -137,12 +143,12 @@ async def start_pipeline(config, frequency_hz, sample_rate, capture_rate):
 
 
 async def read_stderr_pipeline(rtl_proc, sox_proc):
-    """Read stderr from both processes in the pipeline concurrently."""
-    tasks = [
-        asyncio.create_task(_read_stderr_lines(rtl_proc, "RTL_FM")),
-        asyncio.create_task(_read_stderr_lines(sox_proc, "SOX")),
-    ]
-    return asyncio.gather(*tasks, return_exceptions=True)
+    """Log stderr from both pipeline processes until they close it."""
+    return await asyncio.gather(
+        _read_stderr_lines(rtl_proc, "RTL_FM"),
+        _read_stderr_lines(sox_proc, "SOX"),
+        return_exceptions=True,
+    )
 
 
 async def _read_stderr_lines(proc, label):
@@ -155,41 +161,39 @@ async def _read_stderr_lines(proc, label):
             decoded = line.decode("utf-8", errors="replace").strip()
             if decoded:
                 logger.info(f"{label} Log: {decoded}")
-    except (asyncio.CancelledError, Exception):
-        pass  # Cleaned up by caller
+    except asyncio.CancelledError:
+        raise  # Let cancellation propagate so the caller's cancel() works
+    except Exception as e:
+        logger.debug(f"{label} stderr reader stopped: {e}")
 
 
 async def cleanup_pipeline(rtl_proc, sox_proc):
-    """Safely terminate pipeline processes with specific exception handling.
+    """Terminate the pipeline processes and stop the pipe task.
 
-    Waits for the async pipe task (rtl_fm -> sox) to finish before
-    terminating processes, ensuring sox receives EOF on stdin.
+    Processes are terminated first. Waiting for the pipe task before that would
+    mean waiting for an EOF from rtl_fm that `-E pad` never produces, which cost
+    the full timeout on every restart and every add-on stop.
     """
-    # First, wait for the async pipe task to finish so sox gets EOF on stdin.
+    # Terminate rtl_fm first so the pipe task sees EOF, then sox.
+    for name, proc in (("RTL_FM", rtl_proc), ("SOX", sox_proc)):
+        if proc is None:
+            continue
+        try:
+            if proc.returncode is None:  # Still running
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=PROC_TERM_TIMEOUT)
+                except TimeoutError:
+                    logger.warning(f"{name} did not terminate gracefully, killing")
+                    proc.kill()
+                    await proc.wait()
+        except ProcessLookupError:
+            logger.debug(f"{name} process already exited")
+        except OSError as e:
+            logger.debug(f"Error cleaning up {name}: {e}")
+
     pipe_task = getattr(sox_proc, "_pipe_task", None) if sox_proc else None
     if pipe_task is not None and not pipe_task.done():
-        try:
-            await asyncio.wait_for(pipe_task, timeout=10.0)
-        except TimeoutError:
-            logger.warning("Pipe task did not finish within timeout")
-        except Exception:
-            logger.debug("Pipe task finished with error (expected on stop)")
-
-    # Stop sox first (it depends on rtl_fm)
-    for name, proc in [("SOX", sox_proc), ("RTL_FM", rtl_proc)]:
-        if proc is not None:
-            try:
-                if proc.returncode is None:  # Still running
-                    proc.terminate()
-                    try:
-                        await asyncio.wait_for(proc.wait(), timeout=5.0)
-                    except TimeoutError:
-                        logger.warning(
-                            f"{name} did not terminate gracefully, forcing kill"
-                        )
-                        proc.kill()
-                        await proc.wait()
-            except ProcessLookupError:
-                logger.debug(f"{name} process already exited")
-            except (OSError, Exception) as e:
-                logger.debug(f"Error cleaning up {name}: {e}")
+        pipe_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await asyncio.wait_for(pipe_task, timeout=PIPE_TASK_TIMEOUT)
