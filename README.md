@@ -35,16 +35,21 @@ Optimized for emergency services (public safety) radio monitoring on VHF (150-17
 | `min_transmission_duration` | Minimum transmission length to transcribe (seconds) | 0.3 |
 | `max_transmission_duration` | Maximum transmission length safety cap (seconds) | 120.0 |
 | `audio_recording` | Enable audio recording for successful transcriptions | false |
+| `audio_public_www` | Write recordings to the unauthenticated `/local/` path instead of `/media` (see warning below) | false |
+| `mqtt_tls` | Connect to the broker over TLS | false |
+| `mqtt_tls_ca` | Path to a CA certificate for `mqtt_tls` (blank = system trust store) | |
 | `audio_retention_days` | Days to keep audio recordings | 7 |
 | `audio_max_files` | Maximum number of audio files (0 = unlimited) | 0 |
 
 ### Audio Recording
 
-When `audio_recording` is enabled, WAV audio files are saved for every successful transcription. Files are stored in `/config/www/radio-audio/` and served via Home Assistant's `/local/` path for playback.
+When `audio_recording` is enabled, WAV audio files are saved for every successful transcription. Files go to `/media/radio-audio/`, which Home Assistant serves only through its authenticated endpoints, and which is what the `media-source://` URI in the MQTT payload resolves to.
+
+**`audio_public_www` (default `false`):** setting this to `true` writes recordings to `/config/www/radio-audio/` instead, which Home Assistant serves at `/local/` with **no authentication**. Anyone who can reach your Home Assistant instance can then list and download recorded traffic. The only reason to enable it is that `/local/` URLs work in a plain HTML5 `<audio>` tag inside a markdown card; `/media` playback needs the media browser or a media player card.
 
 **Audio files are named using the format:** `YYYYMMDD-HHMMSS-XXXX.XX.wav` (16kHz, 16-bit, mono PCM).
 
-**Playback in Lovelace:** Audio files can be played directly in the dashboard using the HTML5 `<audio>` element, or via any media player using the `media-source://media_source/local/radio-audio/<filename>.wav` URI scheme.
+**Playback in Lovelace:** with the default (`/media`), use the `media_player.play_media` action or the Media browser with the `audio_url` value from the payload. With `audio_public_www: true`, `audio_url` is a `/local/...` path that an HTML5 `<audio>` element can play inline; see `home-assistant/lovelace-radio-transcriptions.yaml`.
 
 **Retention policy:** Old recordings are automatically cleaned up based on `audio_retention_days` and `audio_max_files` settings.
 

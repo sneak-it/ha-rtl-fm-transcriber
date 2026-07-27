@@ -12,7 +12,7 @@ from .config import parse_wyoming_url
 from .filters import is_hallucination
 from .mqtt import safe_publish
 from .pipeline import cleanup_pipeline, read_stderr_pipeline, start_pipeline
-from .recording import cleanup_old_recordings, save_audio_recording
+from .recording import audio_dir, audio_url, cleanup_old_recordings, save_audio_recording
 from .timeutil import format_timestamp
 from .transmission import (
     ACTIVE_STATES,
@@ -388,9 +388,11 @@ async def _publish_transcript(
     audio_file_name: str | None = None
 
     if config.get("audio_recording", False) and audio:
+        save_dir = audio_dir(config)
         timestamp_str = format_timestamp(config.get("timezone", "UTC"))
         audio_file_path = await asyncio.to_thread(
-            save_audio_recording, audio, str(config["frequency"]), timestamp_str
+            save_audio_recording,
+            audio, str(config["frequency"]), timestamp_str, save_dir,
         )
         if audio_file_path:
             audio_file_name = os.path.basename(audio_file_path)
@@ -398,6 +400,7 @@ async def _publish_transcript(
                 cleanup_old_recordings,
                 config.get("audio_retention_days", 7),
                 config.get("audio_max_files", 0),
+                save_dir,
             )
 
     message = {
@@ -407,9 +410,7 @@ async def _publish_transcript(
     }
     if audio_file_name:
         message["audio_file"] = f"radio-audio/{audio_file_name}"
-        message["audio_url"] = (
-            f"media-source://media_source/local/radio-audio/{audio_file_name}"
-        )
+        message["audio_url"] = audio_url(config, audio_file_name)
 
     safe_publish(
         mqtt_client, config["mqtt_topic"], json.dumps(message),

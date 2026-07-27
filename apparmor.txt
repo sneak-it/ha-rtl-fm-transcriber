@@ -1,0 +1,46 @@
+#include <tunables/global>
+
+profile rtl_fm_transcriber flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+  #include <abstractions/python>
+
+  # Capabilities the container legitimately needs
+  file,
+  signal (send) set=(kill,term,int,hup,cont),
+  network inet stream,
+  network inet6 stream,
+
+  # S6 / add-on startup
+  /run.sh r,
+  /bin/** ix,
+  /usr/bin/** ix,
+  /usr/lib/** mr,
+  /lib/** mr,
+
+  # Python and the add-on itself
+  /usr/bin/python3* ix,
+  /app/** r,
+
+  # rtl_fm and sox
+  /usr/bin/rtl_fm cx,
+  /usr/bin/rtl_test cx,
+  /usr/bin/sox cx,
+
+  # Add-on options
+  /data/** rw,
+
+  # Recordings
+  /media/** rw,
+  /config/** rw,
+
+  # USB access for the RTL-SDR dongle
+  /dev/bus/usb/** rw,
+  /sys/bus/usb/** r,
+  /sys/devices/** r,
+  /run/udev/data/** r,
+
+  # Deny everything sensitive
+  deny /etc/shadow rwklx,
+  deny /root/** rwklx,
+  deny /proc/sys/kernel/** wklx,
+}

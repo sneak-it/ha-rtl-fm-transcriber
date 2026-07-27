@@ -67,6 +67,13 @@ def create_mqtt_client(config):
     client.on_connect = on_connect
     client.on_disconnect = on_disconnect
 
+    if config.get("mqtt_tls", False):
+        ca = config.get("mqtt_tls_ca") or None
+        client.tls_set(ca_certs=ca)
+        logger.info(
+            f"[MQTT] TLS enabled (ca_certs={ca or 'system trust store'})"
+        )
+
     if config.get("mqtt_username"):
         client.username_pw_set(config["mqtt_username"], config.get("mqtt_password", ""))
         logger.info(f"[MQTT] Username configured for broker at {config['mqtt_host']}")

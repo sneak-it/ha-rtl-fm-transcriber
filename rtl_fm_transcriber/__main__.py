@@ -9,7 +9,7 @@ import subprocess
 import time
 
 from .capture import capture_loop, check_wyoming_connection
-from .config import load_config
+from .config import ConfigError, load_config, validate_config
 from .mqtt import (
     AVAILABILITY_OFFLINE,
     create_mqtt_client,
@@ -54,6 +54,12 @@ def main():
     # rather than run.sh exporting TZ separately.
     os.environ["TZ"] = config.get("timezone", "UTC")
     time.tzset()
+
+    try:
+        validate_config(config)
+    except ConfigError as e:
+        logger.error(f"Invalid configuration: {e}")
+        raise SystemExit(1) from e
 
     # Check RTL-SDR
     try:

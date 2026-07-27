@@ -7,12 +7,13 @@ RUN apk add --no-cache \
     sox \
     python3 \
     py3-pip \
-    tzdata \
-    && pip3 install --no-cache-dir --break-system-packages paho-mqtt wyoming
+    tzdata
 
 WORKDIR /app
 
-# Copy application files
+COPY requirements.txt /app/requirements.txt
+RUN pip3 install --no-cache-dir --break-system-packages -r /app/requirements.txt
+
 COPY rtl_fm_transcriber/ /app/rtl_fm_transcriber/
 COPY run.sh /run.sh
 

@@ -1,5 +1,5 @@
 name: "RTL-FM Transcriber"
-version: "1.4.0"
+version: "1.5.0"
 slug: rtl-fm-transcriber
 description: "Captures FM radio via RTL-SDR, transcribes with Whisper, publishes to MQTT"
 init: false
@@ -12,22 +12,24 @@ boot: auto
 # Start after the broker, and take its credentials from the Supervisor.
 services:
   - mqtt:need
-host_network: true
 usb: true
 udev: true
 devices:
   - /dev/bus/usb
 map:
+  - media:rw
   - config:rw
 options:
   frequency: 155.1075
   squelch: 50
-  whisper_url: "http://youriphere:10300"
+  whisper_url: "tcp://homeassistant.local:10300"
   mqtt_host: "core-mosquitto"
   mqtt_port: 1883
   mqtt_topic: "radio/transcription"
   mqtt_username: ""
   mqtt_password: ""
+  mqtt_tls: false
+  mqtt_tls_ca: ""
   gain: "auto"
   ppm: 0
   bandpass_filter: true
@@ -46,31 +48,35 @@ options:
   wyoming_reconnect_delay: 1.0
   # Audio recording settings
   audio_recording: false
+  audio_public_www: false
   audio_retention_days: 7
   audio_max_files: 0
 schema:
-  frequency: float
+  frequency: float(24,1766)
   squelch: int(0,200)
-  whisper_url: url
+  whisper_url: str
   mqtt_host: str
-  mqtt_port: int
+  mqtt_port: int(1,65535)
   mqtt_topic: str
   mqtt_username: str?
-  mqtt_password: str?
+  mqtt_password: password?
+  mqtt_tls: bool
+  mqtt_tls_ca: str?
   gain: str?
-  ppm: int(0,500)
+  ppm: int(-500,500)
   bandpass_filter: bool
   bandpass_low: int(100,5000)
   bandpass_high: int(1000,12000)
   timezone: str?
-  silence_timeout: float
+  silence_timeout: float(0.2,30.0)
   vad_warmup_ms: int(50,1000)
-  min_transmission_duration: float
-  max_transmission_duration: float
-  wyoming_connection_timeout: float
-  wyoming_read_timeout: float
+  min_transmission_duration: float(0.05,10.0)
+  max_transmission_duration: float(1.0,600.0)
+  wyoming_connection_timeout: float(1.0,120.0)
+  wyoming_read_timeout: float(1.0,300.0)
   wyoming_reconnect_max_attempts: int(1,10)
   wyoming_reconnect_delay: float(0.5,10.0)
   audio_recording: bool
+  audio_public_www: bool
   audio_retention_days: int(1,365)
   audio_max_files: int(0,10000)
