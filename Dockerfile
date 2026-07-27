@@ -7,14 +7,15 @@ RUN apk add --no-cache \
     sox \
     python3 \
     py3-pip \
-    py3-requests \
     tzdata \
     && pip3 install --no-cache-dir --break-system-packages paho-mqtt wyoming
 
+WORKDIR /app
+
 # Copy application files
-COPY transcriber.py /transcriber.py
+COPY rtl_fm_transcriber/ /app/rtl_fm_transcriber/
 COPY run.sh /run.sh
 
-RUN chmod a+x /run.sh /transcriber.py
+RUN chmod a+x /run.sh
 
 CMD [ "/run.sh" ]
