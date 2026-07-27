@@ -89,7 +89,9 @@ async def start_pipeline(config, frequency_hz, sample_rate, capture_rate):
                 "lowpass",
                 str(bandpass_high),  # Remove high-frequency static
                 "gain",
-                "-3",  # Compensate for volume loss from filtering
+                # Headroom, not makeup gain: the IIR filters can overshoot on
+                # transients and this keeps the result from clipping.
+                "-3",
             ]
         )
 
@@ -124,7 +126,7 @@ async def start_pipeline(config, frequency_hz, sample_rate, capture_rate):
                     await writer.drain()
                 writer.close()
                 await writer.wait_closed()
-            except (asyncio.CancelledError, Exception):
+            except (asyncio.CancelledError, OSError):
                 writer.close()
                 with contextlib.suppress(asyncio.InvalidStateError, RuntimeError):
                     await writer.wait_closed()
@@ -163,7 +165,7 @@ async def _read_stderr_lines(proc, label):
                 logger.info(f"{label} Log: {decoded}")
     except asyncio.CancelledError:
         raise  # Let cancellation propagate so the caller's cancel() works
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - diagnostics only; never fail the pipeline
         logger.debug(f"{label} stderr reader stopped: {e}")
 
 
@@ -195,5 +197,5 @@ async def cleanup_pipeline(rtl_proc, sox_proc):
     pipe_task = getattr(sox_proc, "_pipe_task", None) if sox_proc else None
     if pipe_task is not None and not pipe_task.done():
         pipe_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
+        with contextlib.suppress(asyncio.CancelledError, TimeoutError, OSError):
             await asyncio.wait_for(pipe_task, timeout=PIPE_TASK_TIMEOUT)

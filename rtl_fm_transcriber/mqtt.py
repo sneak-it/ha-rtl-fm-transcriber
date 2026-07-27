@@ -133,7 +133,7 @@ def safe_publish(client, topic, payload, qos=0, retain=False, label="message") -
         return False
     try:
         result = client.publish(topic, payload, qos=qos, retain=retain)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - publishing must never raise into callers
         logger.error(
             f"[MQTT] {label} publish failed: type={type(e).__name__}, error={e}"
         )

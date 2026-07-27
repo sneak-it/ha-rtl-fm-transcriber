@@ -3,6 +3,7 @@
 import logging
 import os
 import time
+from datetime import datetime
 
 from .audio import create_wav_header
 
@@ -32,53 +33,49 @@ def audio_url(config, filename: str) -> str:
     return f"media-source://media_source/local/{SUBDIR}/{filename}"
 
 
+def recording_filename(stamp: datetime, frequency: str, counter: int = 0) -> str:
+    """Build a sortable WAV filename: YYYYMMDD-HHMMSS-<freq>.wav.
+
+    Formatted straight from the datetime. Scrubbing an ISO string instead used to
+    strip the minus sign from a negative UTC offset and fuse the offset digits
+    into the time, so every US-timezone user got names like
+    20260727T1215000400-155_1075.wav.
+    """
+    freq_safe = str(frequency).replace(".", "_")
+    suffix = f"_{counter}" if counter else ""
+    return f"{stamp.strftime('%Y%m%d-%H%M%S')}-{freq_safe}{suffix}.wav"
+
+
 def save_audio_recording(
     audio_data: bytes,
     frequency: str,
-    timestamp_str: str,
+    stamp: datetime,
     save_dir: str = MEDIA_DIR,
 ) -> str | None:
     """Save audio recording as a WAV file.
-    
+
     Args:
         audio_data: Raw PCM16 audio bytes.
         frequency: The radio frequency as a string (e.g., "155.1075").
-        timestamp_str: ISO-format timestamp string for the filename.
+        stamp: Local time of the transmission, used for the filename.
         save_dir: Directory to write into.
 
     Returns:
-        Relative path to the saved file, or None on failure.
+        Path to the saved file, or None on failure.
     """
     try:
         os.makedirs(save_dir, exist_ok=True)
     except OSError as e:
         logger.error(f"[Audio] Failed to create audio directory {save_dir}: {e}")
         return None
-    
-    # Generate filename: YYYYMMDD-HHMMSS-XXXX.XX.wav
-    # Use the timestamp string to derive a sortable name
-    ts_clean = ""
-    freq_safe = str(frequency).replace(".", "_")
-    try:
-        # Parse ISO timestamp to get a clean filename component
-        # Handle formats like "2026-01-25T18:15:00+00:00" or "2026-01-25T18:15:00Z"
-        ts_clean = timestamp_str.replace(":", "").replace("-", "").replace("Z", "").split("+")[0]
-        # Remove trailing fractional digits beyond 6 (microseconds)
-        if "." in ts_clean:
-            ts_clean = ts_clean.split(".")[0]
-        filename = f"{ts_clean}-{freq_safe}.wav"
-    except Exception:
-        # Fallback to epoch-based naming
-        ts_clean = str(int(time.time()))
-        filename = f"{ts_clean}-{freq_safe}.wav"
-    
-    filepath = os.path.join(save_dir, filename)
-    
-    # Handle potential filename collisions
+
     counter = 0
+    filepath = os.path.join(save_dir, recording_filename(stamp, frequency))
     while os.path.exists(filepath):
         counter += 1
-        filepath = os.path.join(save_dir, f"{ts_clean}-{freq_safe}_{counter}.wav")
+        filepath = os.path.join(
+            save_dir, recording_filename(stamp, frequency, counter)
+        )
     
     try:
         wav_header = create_wav_header(len(audio_data))
@@ -126,7 +123,9 @@ def cleanup_old_recordings(
     if not files:
         return
     
-    # Remove files older than retention period
+    # Remove files older than the retention period, keeping the survivors so the
+    # max_files pass below does not try to delete them again.
+    remaining = []
     removed = 0
     for filepath, mtime in files:
         if now - mtime > retention_seconds:
@@ -136,21 +135,25 @@ def cleanup_old_recordings(
                 removed += 1
             except OSError as e:
                 logger.warning(f"[Audio] Failed to remove {filepath}: {e}")
-    
+        else:
+            remaining.append((filepath, mtime))
+
     if removed:
         logger.info(f"[Audio] Cleaned up {removed} old recording(s)")
-    
-    # Enforce max files limit if set
+
     if max_files <= 0:
         return
-    
-    # Sort by modification time (oldest first)
-    files.sort(key=lambda x: x[1])
-    
-    while len(files) > max_files:
-        oldest_path, _ = files.pop(0)
+
+    # Oldest first
+    remaining.sort(key=lambda x: x[1])
+    excess = 0
+    while len(remaining) > max_files:
+        oldest_path, _ = remaining.pop(0)
         try:
             os.remove(oldest_path)
-            logger.debug(f"[Audio] Removed excess recording: {oldest_path}")
+            excess += 1
         except OSError as e:
             logger.warning(f"[Audio] Failed to remove {oldest_path}: {e}")
+
+    if excess:
+        logger.info(f"[Audio] Removed {excess} recording(s) over the max_files limit")

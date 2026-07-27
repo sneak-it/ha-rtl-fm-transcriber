@@ -4,14 +4,14 @@ line-length = 100
 exclude = [".ruff_cache", "__pycache__"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "SIM", "ASYNC", "B", "RUF", "PLW"]
+select = ["E", "F", "I", "UP", "SIM", "ASYNC", "B", "RUF", "PLW", "BLE", "S"]
 # E501: existing log strings run long; not worth reflowing.
-# ASYNC109: Wyoming connect/stop_session own their timeout by design (review B7/B8).
-# BLE/S: enabled once the broad except unions are tightened (review item F7).
+# ASYNC109: the Wyoming connect/stop_session timeouts are part of their contract.
 ignore = ["E501", "ASYNC109"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["PLW"]
+# Tests assert on broad failure handling and use asserts by design.
+"tests/*" = ["PLW", "S101", "S105", "BLE", "SLF001"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

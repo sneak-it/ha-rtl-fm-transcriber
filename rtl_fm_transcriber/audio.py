@@ -24,9 +24,10 @@ def compute_rms(raw_bytes: bytes) -> float:
     
     # Unpack as little-endian signed 16-bit integers
     samples = struct.unpack(f'<{num_samples}h', raw_bytes[:num_samples * 2])
-    
-    # Calculate RMS
-    sum_squares = sum(s * s for s in samples)
+
+    # sumprod runs in C; the equivalent generator expression was the hottest
+    # line in the capture loop on armv7.
+    sum_squares = math.sumprod(samples, samples)
     return math.sqrt(sum_squares / num_samples) / 32768.0
 
 

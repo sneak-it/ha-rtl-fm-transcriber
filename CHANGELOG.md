@@ -1,5 +1,125 @@
 # Changelog
 
+## 1.5.0
+
+Production-readiness release. Behaviour changes, so read the breaking notes
+before updating.
+
+### Breaking
+
+- **Voice detection is now squelch-gated.** `rtl_fm` already ran with
+  `-l <squelch> -E pad`, which emits zero-padded samples while the squelch is
+  closed, but detection treated "quieter than the baseline" as voice, making
+  digital silence the most voice-like input possible. Depending on what the air
+  sounded like at startup, that either streamed endless silence to Whisper or
+  never detected anything at all. A chunk now counts as voice when rtl_fm is
+  passing real audio, and **`squelch` is the sensitivity knob**: raise it to
+  ignore noise, lower it to catch weaker transmissions.
+- **Removed options** `vad_threshold`, `vad_baseline_window` and
+  `vad_recovery_seconds`. The first two belonged to the old baseline detector.
+  `vad_recovery_seconds` and `silence_timeout` were assigned to each other's
+  attributes and only one was ever read; `silence_timeout` is now the single
+  silence setting.
+- **Removed options** `chunk_duration` and `debug_audio`, which nothing read.
+- **Recordings moved to `/media/radio-audio`.** `/config/www` is served at
+  `/local/` with no authentication, so recorded public-safety traffic was
+  downloadable by anyone who could reach Home Assistant. `/media` is served only
+  through authenticated endpoints and is what the `media-source://` URI in the
+  MQTT payload always claimed. Set `audio_public_www: true` to keep the old
+  location, needed only for inline `<audio>` playback in a markdown card.
+- **The audio sensor's entity is recreated.** Its `unique_id` was
+  `rtl_fm_<freq>_audio_audio`; the doubled suffix is fixed. The old retained
+  discovery payload is cleared on startup so Home Assistant drops the stale
+  entity rather than leaving an orphan.
+- **`host_network` removed.** The add-on only makes outbound connections.
+- The `mqtt:need` service is declared, so the Supervisor starts this add-on
+  after Mosquitto and can supply broker credentials.
+
+### Fixed, transmission segmentation
+
+- Silence never ended a transmission on the normal data path: the
+  `WAITING_FOR_END` state was checked but never assigned, so the only working
+  end path was a read timeout that `-E pad` makes rare. Every transmission ran
+  to the 120s cap, arriving minutes late with separate transmissions merged.
+- Voice chunks arriving during warmup were discarded, and warmup only advanced
+  on non-voice chunks, so a strong continuous transmission stalled and lost
+  audio.
+- The warmup timeout started streaming without connecting to the Wyoming server,
+  after which every chunk was dropped and the whole transmission vanished with
+  "No transcript".
+- The chunk completing warmup was sent and recorded twice, so saved WAVs
+  stuttered at every transmission start.
+- `max_transmission_duration` was only checked when no voice was present, so a
+  stuck-open carrier streamed forever. It is now checked on every chunk, and a
+  carrier that outlives it splits into consecutive transmissions instead of
+  being truncated.
+
+### Fixed, connections and shutdown
+
+- TCP connections to the Wyoming server leaked on every transmission and every
+  retry, eventually exhausting sockets on a busy channel.
+- The Wyoming connect timeout was accepted and logged but never applied, so an
+  unreachable host blocked for the OS TCP timeout while audio piled up.
+- Waiting for a transcript blocked audio capture for up to 30s and skewed the
+  timers for the following transmission. Transcription now runs in the
+  background, and the configurable `wyoming_read_timeout` is finally used.
+- Discarding a too-short transmission left the server holding orphaned audio.
+- Pipeline teardown waited for an EOF that `-E pad` never produces, so every
+  restart and every add-on stop burned a 10s timeout; a second drain could hang
+  the add-on outright instead of restarting it.
+- Two stderr reader tasks leaked on every pipeline restart.
+- Restart backoff was unreachable: an unplugged or claimed dongle looped at 1s
+  forever. Backoff now only resets after a pipeline has actually run.
+- Audio was written to `sox` without backpressure, so a stall grew memory
+  without bound.
+- MQTT reconnection raced paho's own network thread and tore down connections
+  that had just succeeded, and it blocked the event loop for up to 3s.
+  Connectivity is now tracked through callbacks and reconnection left to paho.
+- A briefly-unavailable broker at startup killed the add-on; startup now retries
+  and then continues.
+- SIGTERM was ignored, because Python runs as PID 1. Every stop or update waited
+  out Docker's kill timeout and then SIGKILLed, leaving the USB device in a bad
+  state. Stops are now clean.
+- A fixed MQTT `client_id` meant two instances on different frequencies
+  disconnected each other repeatedly.
+
+### Fixed, other
+
+- Recording filenames mangled negative UTC offsets, so every US-timezone user
+  got names like `20260727T1215000400-155_1075.wav`. They now match the
+  documented `YYYYMMDD-HHMMSS-<freq>.wav`.
+- The hallucination filter discarded legitimate traffic: "subscriber", routine
+  trunked-radio jargon, matched the "subscribe" phrase. Matching is now on word
+  boundaries.
+- Retention cleanup logged spurious "Failed to remove" warnings for files it had
+  already deleted.
+- Timestamps used a fixed UTC offset, which was wrong on either side of a DST
+  transition; they now use `zoneinfo`.
+- Frequency tuning truncated instead of rounding, tuning some frequencies 1 Hz
+  low.
+
+### Added
+
+- Optional `mqtt_tls` with an optional CA path.
+- A retained availability topic plus a last will, so Home Assistant marks
+  entities unavailable instead of showing stale transcripts forever.
+- Startup validation of the Wyoming URL, frequency range, gain, bandpass
+  ordering and duration bounds, failing with a message naming the option. A
+  scheme-less `host:port` is now accepted; previously it silently fell back to
+  localhost.
+- An AppArmor profile, pinned dependencies and pinned base images.
+- `DOCS.md`, `translations/en.yaml` for the options UI, and CI running lint,
+  tests and an add-on build for all three architectures.
+
+### Changed
+
+- The single 1870-line `transcriber.py` is now the `rtl_fm_transcriber` package,
+  twelve modules with one concern each. `transcriber.py` remains as an
+  entry-point shim. Segmentation is a pure function covered by 119 tests.
+- Roughly 300 lines of never-called code removed.
+- `ppm` accepts negative values, which cheap dongles commonly need.
+- The broker password no longer renders in clear text in the configuration UI.
+
 ## 1.4.0
 
 - Added IANA timezone support (`timezone` env var) for localized timestamps in transcriptions and recordings

@@ -13,7 +13,7 @@ from .filters import is_hallucination
 from .mqtt import safe_publish
 from .pipeline import cleanup_pipeline, read_stderr_pipeline, start_pipeline
 from .recording import audio_dir, audio_url, cleanup_old_recordings, save_audio_recording
-from .timeutil import format_timestamp
+from .timeutil import format_timestamp, now_local
 from .transmission import (
     ACTIVE_STATES,
     BUFFER,
@@ -46,7 +46,7 @@ HEALTHY_RUNTIME = 30.0
 
 async def capture_loop(config, mqtt_client):
     """Supervise the capture pipeline, restarting it with backoff on failure."""
-    frequency_hz = int(config["frequency"] * 1_000_000)
+    frequency_hz = round(config["frequency"] * 1_000_000)
     sample_rate = 16000
     # 12000 Hz sample rate for narrowband FM (12.5 kHz public safety channels)
     capture_rate = 12000
@@ -81,7 +81,7 @@ async def capture_loop(config, mqtt_client):
             except asyncio.CancelledError:
                 await cleanup_pipeline(rtl_proc, sox_proc)
                 raise
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - supervisor boundary; restart below
                 logger.error(f"Capture loop error: {e}")
             finally:
                 ran_for = time.monotonic() - started
@@ -218,7 +218,7 @@ async def _run_pipeline(rtl_proc, sox_proc, config, mqtt_client, warmup_bytes):
                 transmission.reset()
     finally:
         stderr_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
+        with contextlib.suppress(asyncio.CancelledError, OSError):
             await stderr_task
 
         # Let in-flight transcriptions finish rather than orphaning them.
@@ -253,7 +253,7 @@ async def _open_session(
     try:
         await wyoming.start_session(wyoming.client)
         await wyoming.send_chunk(bytes(transmission.warmup_buffer))
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - skip this transmission, keep capturing
         logger.error(
             f"[Wyoming] Failed to start session ({wyoming.classify_error(e)}): {e}"
         )
@@ -273,7 +273,7 @@ async def _send_chunk(
     try:
         await wyoming.send_chunk(chunk)
         return True
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - classified below, then reconnect or skip
         error_type = wyoming.classify_error(e)
         logger.error(f"[Wyoming] Failed to send chunk ({error_type}): {e}")
 
@@ -288,7 +288,7 @@ async def _send_chunk(
 
     try:
         await wyoming.start_session(wyoming.client)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - skip this transmission, keep capturing
         logger.error(f"[Wyoming] Failed to restart session after reconnect: {e}")
         return False
 
@@ -362,7 +362,7 @@ async def _transcribe_and_publish(
         read_timeout = config.get("wyoming_read_timeout", 30.0)
         try:
             transcript = await wyoming.stop_session(timeout=read_timeout)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - lose this transcript, not the add-on
             logger.error(f"[Wyoming] Error ending transmission: {e}")
             return
 
@@ -389,10 +389,10 @@ async def _publish_transcript(
 
     if config.get("audio_recording", False) and audio:
         save_dir = audio_dir(config)
-        timestamp_str = format_timestamp(config.get("timezone", "UTC"))
+        stamp = now_local(config.get("timezone", "UTC"))
         audio_file_path = await asyncio.to_thread(
             save_audio_recording,
-            audio, str(config["frequency"]), timestamp_str, save_dir,
+            audio, str(config["frequency"]), stamp, save_dir,
         )
         if audio_file_path:
             audio_file_name = os.path.basename(audio_file_path)

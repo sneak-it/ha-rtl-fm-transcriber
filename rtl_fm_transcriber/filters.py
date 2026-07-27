@@ -1,10 +1,10 @@
 """Whisper hallucination filtering."""
 
+import re
 
-def is_hallucination(text):
-    """Check for common Whisper hallucinations on silence."""
-    # Phrase-based hallucinations
-    phrase_hallucinations = [
+# Matched on word boundaries: plain substring matching discarded legitimate
+# traffic, because "subscribe" is inside "subscriber".
+_PHRASES = [
         "thank you for watching",
         "thanks for watching",
         "subs by",
@@ -15,21 +15,23 @@ def is_hallucination(text):
         "like and subscribe",
         "transcribed by",
         "subtitles by",
-    ]
-    # Single-word hallucinations (only if they are the entire text)
-    single_word_hallucinations = [
-        "you",
-    ]
-    
+]
+
+# Hallucinations only when they are the entire transcript
+_EXACT = frozenset({"you"})
+
+_PATTERNS = [re.compile(rf"\b{re.escape(p)}\b") for p in _PHRASES]
+
+
+def is_hallucination(text):
+    """Check for common Whisper hallucinations on silence."""
     text_lower = text.lower().strip()
 
     # Empty or very short
     if len(text_lower) < 2:
         return True
 
-    # Check for phrase-based hallucinations
-    if any(h in text_lower for h in phrase_hallucinations):
+    if any(p.search(text_lower) for p in _PATTERNS):
         return True
-        
-    # Check for single-word hallucinations (exact match)
-    return text_lower in single_word_hallucinations
+
+    return text_lower in _EXACT

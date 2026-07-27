@@ -63,9 +63,15 @@ def main():
 
     # Check RTL-SDR
     try:
-        subprocess.run(["rtl_test", "-t"], capture_output=True, timeout=10, check=False)
+        subprocess.run(
+            # Resolved via PATH, which is fixed inside the add-on image.
+            ["rtl_test", "-t"],  # noqa: S607
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
         logger.info("RTL-SDR device check passed")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - probe only; rtl_fm reports real faults
         logger.error(f"RTL-SDR check failed: {e}")
         # Continue anyway, let rtl_fm fail if must
 

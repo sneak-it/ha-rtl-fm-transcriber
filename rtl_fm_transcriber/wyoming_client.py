@@ -93,7 +93,7 @@ class WyomingStreamingClient:
             self._connection_state = self.STATE_DISCONNECTED
             logger.error(f"[Wyoming] OS error connecting to {host}:{port}: {e}")
             return False
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - report failure, let the caller retry
             self._connection_state = self.STATE_DISCONNECTED
             logger.error(f"[Wyoming] Unexpected error connecting to {host}:{port}: {e}")
             return False
@@ -104,7 +104,7 @@ class WyomingStreamingClient:
             try:
                 await self.client.__aexit__(None, None, None)
                 logger.debug("[Wyoming] Connection closed gracefully")
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - closing must always succeed
                 logger.warning(f"[Wyoming] Error closing connection: {e}")
             self.client = None
         self._connection_state = self.STATE_DISCONNECTED
@@ -255,7 +255,7 @@ class WyomingStreamingClient:
                 
                 # Ignore transcript-chunk events (we only need the final result)
         
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - return whatever transcript we have
             error_type = self.classify_error(e)
             logger.error(
                 f"[Wyoming] Error waiting for transcript ({error_type}): {e}"
