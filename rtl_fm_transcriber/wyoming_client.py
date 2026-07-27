@@ -35,7 +35,7 @@ class WyomingStreamingClient:
         self._session_active: bool = False
         self._connection_state: str = self.STATE_DISCONNECTED
 
-    def _classify_error(self, e: Exception) -> str:
+    def classify_error(self, e: Exception) -> str:
         """Classify a Wyoming connection error for logging.
         
         Returns a string describing the error type:
@@ -129,7 +129,7 @@ class WyomingStreamingClient:
             and self.client is not None
         )
     
-    async def _reconnect_with_backoff(
+    async def reconnect_with_backoff(
         self, config: dict, host: str, port: int
     ) -> bool:
         """Reconnect to Wyoming with exponential backoff.
@@ -264,7 +264,7 @@ class WyomingStreamingClient:
                 # Ignore transcript-chunk events (we only need the final result)
         
         except Exception as e:
-            error_type = self._classify_error(e)
+            error_type = self.classify_error(e)
             logger.error(
                 f"[Wyoming] Error waiting for transcript ({error_type}): {e}"
             )

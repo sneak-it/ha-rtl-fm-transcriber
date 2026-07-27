@@ -28,8 +28,6 @@ def load_config():
         "mqtt_topic": "radio/transcription",
         "mqtt_username": "",
         "mqtt_password": "",
-        "vad_threshold": 0.03,
-        "vad_baseline_window": 30,
         "gain": "auto",
         "ppm": 0,
         "bandpass_filter": True,
@@ -41,7 +39,6 @@ def load_config():
         "vad_warmup_ms": 150,
         "min_transmission_duration": 0.3,
         "max_transmission_duration": 120.0,
-        "vad_recovery_seconds": 1.0,
         # Audio recording options
         "audio_recording": False,
         "audio_retention_days": 7,
