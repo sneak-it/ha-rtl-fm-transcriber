@@ -1,19 +1,49 @@
 """Entry point: startup checks, discovery, and the capture loop."""
 
 import asyncio
+import contextlib
 import logging
 import os
+import signal
 import subprocess
 import time
 
 from .capture import capture_loop, check_wyoming_connection
 from .config import load_config
-from .mqtt import create_mqtt_client, publish_audio_discovery, publish_discovery
+from .mqtt import (
+    AVAILABILITY_OFFLINE,
+    create_mqtt_client,
+    publish_audio_discovery,
+    publish_availability,
+    publish_discovery,
+)
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+def _request_stop(task: asyncio.Task, sig: signal.Signals) -> None:
+    logger.info(f"Received {sig.name}, shutting down")
+    task.cancel()
+
+
+async def _run(config, mqtt_client) -> None:
+    """Run the capture loop until it finishes or a stop signal arrives."""
+    loop = asyncio.get_running_loop()
+    capture = asyncio.create_task(capture_loop(config, mqtt_client))
+
+    # Python runs as PID 1 here (init: false), where the default SIGTERM
+    # disposition is to ignore it. Without these handlers every add-on stop or
+    # update waited out Docker's kill timeout and then SIGKILLed, so nothing was
+    # cleaned up and the USB device was sometimes left in a bad state.
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(sig, lambda s=sig: _request_stop(capture, s))
+
+    with contextlib.suppress(asyncio.CancelledError):
+        await capture
 
 
 def main():
@@ -35,28 +65,24 @@ def main():
 
     mqtt_client = create_mqtt_client(config)
 
-    # Publish HA Discovery
     publish_discovery(config, mqtt_client)
-    
-    # Publish audio sensor discovery if recording is enabled
     if config.get("audio_recording", False):
         publish_audio_discovery(config, mqtt_client)
 
     # Check Wyoming server connectivity on startup
-    wyoming_available = asyncio.run(check_wyoming_connection(config))
-    if not wyoming_available:
+    if not asyncio.run(check_wyoming_connection(config)):
         logger.warning(
             "[Wyoming] Server not reachable at startup. "
             "Will retry connection on next transmission."
         )
 
     try:
-        asyncio.run(capture_loop(config, mqtt_client))
-    except KeyboardInterrupt:
-        pass
+        asyncio.run(_run(config, mqtt_client))
     finally:
+        publish_availability(mqtt_client, config, AVAILABILITY_OFFLINE)
         mqtt_client.loop_stop()
         mqtt_client.disconnect()
+        logger.info("RTL-FM Transcriber stopped")
 
 
 if __name__ == "__main__":

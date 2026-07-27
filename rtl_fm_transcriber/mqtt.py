@@ -2,19 +2,70 @@
 
 import json
 import logging
+import threading
+import time
 
 import paho.mqtt.client as mqtt
 
 logger = logging.getLogger(__name__)
 
+# Startup connect retry
+CONNECT_ATTEMPTS = 10
+CONNECT_BACKOFF_MAX = 30.0
+CONNECT_WAIT = 5.0
+
+AVAILABILITY_ONLINE = "online"
+AVAILABILITY_OFFLINE = "offline"
+
+
+def availability_topic(config) -> str:
+    """Topic carrying online/offline, referenced by the discovery payloads."""
+    return f"{config['mqtt_topic']}/availability"
+
+
+def client_id(config) -> str:
+    """Per-frequency client id, so two instances do not evict each other."""
+    return f"rtl-fm-transcriber-{str(config['frequency']).replace('.', '_')}"
+
 
 def create_mqtt_client(config):
-    """Create and connect MQTT client."""
+    """Connect to the broker, retrying with backoff, and return the client.
+
+    Connectivity is tracked through the on_connect/on_disconnect callbacks
+    rather than polled, and paho's own reconnect thread does the reconnecting;
+    calling reconnect() by hand raced it and tore down connections that had just
+    succeeded.
+    """
     logger.info("[MQTT] Initializing MQTT client...")
     client = mqtt.Client(
         callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-        client_id="rtl-fm-transcriber",
+        client_id=client_id(config),
     )
+    connected = threading.Event()
+    client.rtl_connected = connected
+
+    def on_connect(_client, _userdata, _flags, reason_code, _properties=None):
+        if reason_code == 0:
+            logger.info(
+                f"[MQTT] Connected to {config['mqtt_host']}:{config['mqtt_port']}"
+            )
+            connected.set()
+            _client.publish(
+                availability_topic(config), AVAILABILITY_ONLINE, qos=1, retain=True
+            )
+        else:
+            connected.clear()
+            logger.error(f"[MQTT] Connection refused by broker: {reason_code}")
+
+    def on_disconnect(_client, _userdata, _flags, reason_code, _properties=None):
+        connected.clear()
+        if reason_code:
+            logger.warning(
+                f"[MQTT] Disconnected ({reason_code}); paho will reconnect"
+            )
+
+    client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
 
     if config.get("mqtt_username"):
         client.username_pw_set(config["mqtt_username"], config.get("mqtt_password", ""))
@@ -22,77 +73,50 @@ def create_mqtt_client(config):
     else:
         logger.info("[MQTT] No username configured (anonymous connection)")
 
-    logger.info(
-        f"[MQTT] Connecting to broker at {config['mqtt_host']}:{config['mqtt_port']} (timeout: 60s)..."
+    # Last will, so Home Assistant sees the add-on go away instead of showing
+    # stale transcripts forever.
+    client.will_set(
+        availability_topic(config), AVAILABILITY_OFFLINE, qos=1, retain=True
     )
+    client.reconnect_delay_set(min_delay=1, max_delay=int(CONNECT_BACKOFF_MAX))
 
-    try:
-        client.connect(config["mqtt_host"], config["mqtt_port"], 60)
-        logger.info("[MQTT] Connect packet sent, starting network loop...")
-        client.loop_start()
-        logger.info("[MQTT] Network loop started (background thread)")
+    host, port = config["mqtt_host"], config["mqtt_port"]
+    client.loop_start()
 
-        # Verify connection state after starting the loop
-        import time as _time
-        _time.sleep(0.5)  # Give network thread time to establish connection
-        if client.is_connected():
-            logger.info(
-                f"[MQTT] Successfully connected to MQTT broker at {config['mqtt_host']}:{config['mqtt_port']}"
-            )
+    for attempt in range(1, CONNECT_ATTEMPTS + 1):
+        logger.info(
+            f"[MQTT] Connecting to {host}:{port} (attempt {attempt}/{CONNECT_ATTEMPTS})"
+        )
+        try:
+            client.connect(host, port, keepalive=60)
+        except OSError as e:
+            logger.error(f"[MQTT] Connect to {host}:{port} failed: {e}")
         else:
-            logger.warning(
-                "[MQTT] loop_start() returned but client.is_connected() is False — "
-                "connection may not be established yet"
-            )
-        return client
-    except Exception as e:
-        logger.error(f"[MQTT] Failed to connect to MQTT broker at {config['mqtt_host']}:{config['mqtt_port']}: {e}")
-        raise
+            if connected.wait(timeout=CONNECT_WAIT):
+                return client
+            logger.warning(f"[MQTT] No CONNACK from {host}:{port} within {CONNECT_WAIT}s")
+
+        if attempt < CONNECT_ATTEMPTS:
+            delay = min(2.0 ** (attempt - 1), CONNECT_BACKOFF_MAX)
+            logger.info(f"[MQTT] Retrying in {delay:.0f}s")
+            time.sleep(delay)
+
+    # Returning the client rather than raising: a broker that is briefly
+    # unavailable at boot should not kill the add-on, and paho keeps retrying.
+    logger.error(
+        f"[MQTT] Could not reach {host}:{port} after {CONNECT_ATTEMPTS} attempts. "
+        f"Continuing; publishes will be skipped until the broker returns."
+    )
+    return client
 
 
-def is_mqtt_connected(client):
-    """Check if MQTT client is still connected and reconnect if needed.
-    
-    Args:
-        client: MQTT client instance
-        
-    Returns:
-        True if connected (or reconnected), False if reconnection failed
+def is_mqtt_connected(client) -> bool:
+    """Whether the broker connection is currently up.
+
+    No manual reconnect here: paho's network thread owns that, and polling
+    is_connected() straight after a reconnect() call raced it.
     """
-    try:
-        if client.is_connected():
-            return True
-        
-        logger.warning("[MQTT] Client reports disconnected — attempting reconnection...")
-        reconnect_delay = 1.0
-        max_retries = 3
-        for attempt in range(1, max_retries + 1):
-            logger.info(
-                f"[MQTT] Reconnection attempt {attempt}/{max_retries}..."
-            )
-            try:
-                client.reconnect()
-                if client.is_connected():
-                    logger.info(f"[MQTT] Reconnected successfully on attempt {attempt}")
-                    return True
-                else:
-                    logger.warning(f"[MQTT] Reconnect returned but not connected (attempt {attempt})")
-            except Exception as reconnect_err:
-                logger.error(
-                    f"[MQTT] Reconnection attempt {attempt} failed: {reconnect_err}"
-                )
-            
-            if attempt < max_retries:
-                delay = reconnect_delay * attempt
-                logger.info(f"[MQTT] Waiting {delay:.1f}s before next reconnection attempt...")
-                import time as _time
-                _time.sleep(delay)
-        
-        logger.error("[MQTT] All reconnection attempts failed — MQTT publishing will be skipped")
-        return False
-    except Exception as e:
-        logger.error(f"[MQTT] Error checking connection state: {e}")
-        return False
+    return bool(client.is_connected())
 
 
 def safe_publish(client, topic, payload, qos=0, retain=False, label="message") -> bool:
@@ -114,56 +138,72 @@ def safe_publish(client, topic, payload, qos=0, retain=False, label="message") -
     return True
 
 
-def publish_discovery(config, mqtt_client):
-    """Publish Home Assistant MQTT Auto Discovery payload."""
-    # Unique ID based on frequency to allow multiple instances
-    unique_id = f"rtl_fm_{str(config['frequency']).replace('.', '_')}"
-    device_name = f"RTL-FM Scanner {config['frequency']}MHz"
+def publish_availability(client, config, state: str) -> None:
+    """Publish the availability state, used on clean shutdown."""
+    safe_publish(
+        client, availability_topic(config), state,
+        qos=1, retain=True, label=f"availability={state}",
+    )
 
-    discovery_topic = f"homeassistant/sensor/{unique_id}/transcription/config"
-    discovery_payload = json.dumps({
-        "name": "Radio Transcription",
-        "unique_id": f"{unique_id}_transcription",
+
+def device_id(config) -> str:
+    """Stable per-frequency device identifier."""
+    return f"rtl_fm_{str(config['frequency']).replace('.', '_')}"
+
+
+def _publish_sensor_discovery(
+    config, mqtt_client, *, topic, key, name, value_template, icon, label
+):
+    """Publish one HA discovery payload for this device."""
+    dev_id = device_id(config)
+    payload = json.dumps({
+        "name": name,
+        "unique_id": f"{dev_id}_{key}",
         "state_topic": config["mqtt_topic"],
-        "value_template": "{{ value_json.text[:255] }}",
+        "value_template": value_template,
         "json_attributes_topic": config["mqtt_topic"],
-        "icon": "mdi:radio-handheld",
+        "availability_topic": availability_topic(config),
+        "payload_available": AVAILABILITY_ONLINE,
+        "payload_not_available": AVAILABILITY_OFFLINE,
+        "icon": icon,
         "device": {
-            "identifiers": [unique_id],
-            "name": device_name,
+            "identifiers": [dev_id],
+            "name": f"RTL-FM Scanner {config['frequency']}MHz",
             "model": "RTL-SDR",
             "manufacturer": "RTL-FM Transcriber",
         },
     })
+    safe_publish(mqtt_client, topic, payload, retain=True, label=label)
 
-    safe_publish(
-        mqtt_client, discovery_topic, discovery_payload,
-        retain=True, label="transcription discovery",
+
+def publish_discovery(config, mqtt_client):
+    """Publish HA discovery for the transcription sensor."""
+    _publish_sensor_discovery(
+        config, mqtt_client,
+        topic=f"homeassistant/sensor/{device_id(config)}/transcription/config",
+        key="transcription",
+        name="Radio Transcription",
+        value_template="{{ value_json.text[:255] }}",
+        icon="mdi:radio-handheld",
+        label="transcription discovery",
     )
 
 
 def publish_audio_discovery(config, mqtt_client):
-    """Publish Home Assistant MQTT Auto Discovery payload for audio sensor."""
-    unique_id = f"rtl_fm_{str(config['frequency']).replace('.', '_')}_audio"
-    device_name = f"RTL-FM Scanner {config['frequency']}MHz"
-    
-    discovery_topic = f"homeassistant/sensor/{unique_id}/config"
-    discovery_payload = json.dumps({
-        "name": "Radio Audio Recording",
-        "unique_id": f"{unique_id}_audio",
-        "state_topic": config["mqtt_topic"],
-        "value_template": "{{ value_json.timestamp if value_json.audio_file else '' }}",
-        "json_attributes_topic": config["mqtt_topic"],
-        "icon": "mdi:record-rec",
-        "device": {
-            "identifiers": [f"rtl_fm_{str(config['frequency']).replace('.', '_')}"],
-            "name": device_name,
-            "model": "RTL-SDR",
-            "manufacturer": "RTL-FM Transcriber",
-        },
-    })
-    
-    safe_publish(
-        mqtt_client, discovery_topic, discovery_payload,
-        retain=True, label="audio discovery",
+    """Publish HA discovery for the audio recording sensor."""
+    topic = f"homeassistant/sensor/{device_id(config)}_audio/config"
+
+    # Earlier versions set unique_id to "<device>_audio_audio". Clearing the
+    # retained payload first makes HA drop that entity instead of leaving an
+    # orphan alongside the corrected one.
+    safe_publish(mqtt_client, topic, "", retain=True, label="stale audio discovery")
+
+    _publish_sensor_discovery(
+        config, mqtt_client,
+        topic=topic,
+        key="audio",
+        name="Radio Audio Recording",
+        value_template="{{ value_json.timestamp if value_json.audio_file else '' }}",
+        icon="mdi:record-rec",
+        label="audio discovery",
     )

@@ -100,19 +100,24 @@ async def capture_loop(config, mqtt_client):
             retry_count = 0
 
         retry_count += 1
+        delay = min(INITIAL_RETRY_DELAY * (2 ** (retry_count - 1)), MAX_RETRY_DELAY)
+
+        # Keep retrying rather than exiting: this add-on has no listening port,
+        # so it cannot use the Supervisor watchdog, and exiting would leave it
+        # stopped until someone noticed. Past the retry threshold the log goes
+        # from warning to a loud, actionable error on every attempt.
         if retry_count > MAX_PIPELINE_RETRIES:
             logger.error(
-                f"Audio pipeline failed {MAX_PIPELINE_RETRIES} times without "
-                f"running for {HEALTHY_RUNTIME:.0f}s. Giving up. Check that the "
-                f"RTL-SDR dongle is connected and not claimed by another process."
+                f"Audio pipeline has failed {retry_count} times without running "
+                f"for {HEALTHY_RUNTIME:.0f}s. Check that the RTL-SDR dongle is "
+                f"connected and not claimed by another process. "
+                f"Retrying in {delay:.0f}s."
             )
-            return
-
-        delay = min(INITIAL_RETRY_DELAY * (2 ** (retry_count - 1)), MAX_RETRY_DELAY)
-        logger.warning(
-            f"Restarting pipeline in {delay:.1f}s "
-            f"(attempt {retry_count}/{MAX_PIPELINE_RETRIES})"
-        )
+        else:
+            logger.warning(
+                f"Restarting pipeline in {delay:.1f}s "
+                f"(attempt {retry_count}/{MAX_PIPELINE_RETRIES})"
+            )
         await asyncio.sleep(delay)
 
 
