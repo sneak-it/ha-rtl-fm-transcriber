@@ -15,10 +15,13 @@ SUBDIR = "radio-audio"
 # Default. /media is served only through Home Assistant's authenticated
 # endpoints and is what the media-source:// URI in the MQTT payload resolves to.
 MEDIA_DIR = f"/media/{SUBDIR}"
-# Opt-in. /config/www is served at /local/ with NO authentication, so anyone who
-# can reach Home Assistant can enumerate and download recordings. Only useful
-# because it allows inline <audio> playback in a dashboard card.
-WWW_DIR = f"/config/www/{SUBDIR}"
+# Opt-in. This is Home Assistant's own config directory, mounted at
+# /homeassistant by the homeassistant_config map (the legacy config map, which
+# put it at /config, was deprecated in Supervisor 2023.11). Its www folder is
+# served at /local/ with NO authentication, so anyone who can reach Home
+# Assistant can enumerate and download recordings. Only useful because it allows
+# inline <audio> playback in a dashboard card.
+WWW_DIR = f"/homeassistant/www/{SUBDIR}"
 
 
 def audio_dir(config) -> str:

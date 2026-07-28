@@ -18,7 +18,11 @@ devices:
   - /dev/bus/usb
 map:
   - media:rw
-  - config:rw
+  # Home Assistant's config directory, mounted at /homeassistant. Only used for
+  # the audio_public_www option, which writes into its www folder. The legacy
+  # "config" map was deprecated in Supervisor 2023.11, hence the version pin.
+  - homeassistant_config:rw
+homeassistant: "2023.11.0"
 options:
   frequency: 155.1075
   squelch: 50

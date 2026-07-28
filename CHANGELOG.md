@@ -32,6 +32,11 @@ before updating.
   discovery payload is cleared on startup so Home Assistant drops the stale
   entity rather than leaving an orphan.
 - **`host_network` removed.** The add-on only makes outbound connections.
+- **Home Assistant 2023.11 or newer is now required** (declared via the
+  `homeassistant` key). The deprecated `config` folder mapping is replaced with
+  `homeassistant_config`, which the Supervisor mounts at `/homeassistant`. Only
+  `audio_public_www` uses it; the `/local/` URLs it produces are unchanged, and
+  existing recordings stay where they are, since it is the same host folder.
 - The `mqtt:need` service is declared, so the Supervisor starts this add-on
   after Mosquitto and can supply broker credentials.
 

@@ -77,7 +77,7 @@ configuration:
     name: Save audio recordings
     description: Write a WAV file for every transcription.
   audio_public_www:
-    name: Store recordings in /config/www
+    name: Store recordings in the Home Assistant www folder
     description: 'WARNING: this path is served at /local/ with no authentication, so anyone who can reach
       Home Assistant can download recordings. Only enable it if you need inline playback in a markdown
       card. The default stores them under /media instead.'

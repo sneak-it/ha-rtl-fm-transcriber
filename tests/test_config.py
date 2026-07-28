@@ -100,7 +100,7 @@ def test_validate_accepts_gain_forms(gain):
 
 
 def test_recordings_default_to_the_authenticated_media_dir():
-    """/config/www is served at /local/ with no authentication."""
+    """Home Assistant's www folder is served at /local/ with no authentication."""
     config = load_config()
     assert config["audio_public_www"] is False
     assert audio_dir(config) == MEDIA_DIR
@@ -122,6 +122,17 @@ def test_public_www_opt_in_changes_both_dir_and_url():
     config = load_config() | {"audio_public_www": True}
     assert audio_dir(config) == WWW_DIR
     assert audio_url(config, "x.wav") == "/local/radio-audio/x.wav"
+
+
+def test_public_www_dir_matches_the_declared_config_mapping():
+    """WWW_DIR must sit under the mount the manifest actually asks for.
+
+    The deprecated "config" mapping mounted Home Assistant's config at /config;
+    homeassistant_config mounts it at /homeassistant. Writing under the wrong
+    root would silently produce files that /local/ does not serve.
+    """
+    assert "homeassistant_config:rw" in MANIFEST["map"]
+    assert WWW_DIR.startswith("/homeassistant/www/")
 
 
 def test_public_www_logs_a_warning(caplog):

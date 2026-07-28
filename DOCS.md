@@ -2,6 +2,14 @@
 
 Configuration reference and usage for the RTL-FM Transcriber add-on.
 
+## Requirements
+
+Home Assistant 2023.11 or newer, an RTL-SDR dongle, an MQTT broker (the Mosquitto
+add-on is detected automatically), and a Wyoming speech-to-text service such as
+the Whisper add-on. The version floor comes from the `homeassistant_config`
+folder mapping, which replaced the deprecated `config` mapping in Supervisor
+2023.11.
+
 ## Configuration
 
 | Option | Description | Default |
@@ -35,7 +43,7 @@ Configuration reference and usage for the RTL-FM Transcriber add-on.
 
 When `audio_recording` is enabled, WAV audio files are saved for every successful transcription. Files go to `/media/radio-audio/`, which Home Assistant serves only through its authenticated endpoints, and which is what the `media-source://` URI in the MQTT payload resolves to.
 
-**`audio_public_www` (default `false`):** setting this to `true` writes recordings to `/config/www/radio-audio/` instead, which Home Assistant serves at `/local/` with **no authentication**. Anyone who can reach your Home Assistant instance can then list and download recorded traffic. The only reason to enable it is that `/local/` URLs work in a plain HTML5 `<audio>` tag inside a markdown card; `/media` playback needs the media browser or a media player card.
+**`audio_public_www` (default `false`):** setting this to `true` writes recordings to the `www/radio-audio/` folder inside your Home Assistant configuration directory instead (the same folder you would reach as `/config/www/radio-audio/` from the Home Assistant side; the add-on sees it at `/homeassistant/www/radio-audio/`). Home Assistant serves it at `/local/` with **no authentication**. Anyone who can reach your Home Assistant instance can then list and download recorded traffic. The only reason to enable it is that `/local/` URLs work in a plain HTML5 `<audio>` tag inside a markdown card; `/media` playback needs the media browser or a media player card.
 
 **Audio files are named using the format:** `YYYYMMDD-HHMMSS-XXXX.XX.wav` (16kHz, 16-bit, mono PCM).
 

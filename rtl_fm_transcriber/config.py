@@ -128,7 +128,8 @@ def validate_config(config: dict) -> None:
 
     if config.get("audio_public_www", False):
         logger.warning(
-            "[Config] audio_public_www is on: recordings go to /config/www and "
+            "[Config] audio_public_www is on: recordings go to the Home Assistant "
+            "www folder and "
             "are served at /local/ with no authentication. Anyone who can reach "
             "Home Assistant can download them."
         )

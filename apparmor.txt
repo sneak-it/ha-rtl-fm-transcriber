@@ -31,7 +31,7 @@ profile rtl_fm_transcriber flags=(attach_disconnected,mediate_deleted) {
 
   # Recordings
   /media/** rw,
-  /config/** rw,
+  /homeassistant/** rw,
 
   # USB access for the RTL-SDR dongle
   /dev/bus/usb/** rw,
