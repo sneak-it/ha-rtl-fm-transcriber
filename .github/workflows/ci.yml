@@ -9,10 +9,10 @@ jobs:
   lint-and-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
+          python-version: "3.14"
       - name: Install dependencies
         run: |
           pip install -r requirements.txt -r requirements-dev.txt
@@ -29,7 +29,7 @@ jobs:
       matrix:
         arch: [amd64, aarch64, armv7]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build ${{ matrix.arch }} add-on image
         uses: home-assistant/builder@master
         with:
