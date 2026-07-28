@@ -4,169 +4,50 @@ Home Assistant add-on that captures FM radio via RTL-SDR, transcribes with Whisp
 
 Optimized for emergency services (public safety) radio monitoring on VHF (150-174 MHz) and UHF (421-512 MHz) bands using narrowband FM (12.5 kHz channels).
 
+Requires Home Assistant 2023.11 or newer, on amd64 or aarch64.
+
 ## Installation
 
-1. Copy this folder to your Home Assistant's `/addons/` directory
-2. In Home Assistant, go to **Settings → Add-ons → Add-on Store**
-3. Click the **⋮** menu (top right) → **Check for updates**
-4. Find "RTL-FM Transcriber" in **Local add-ons** section
-5. Click **Install**
+1. In Home Assistant, go to **Settings → Add-ons → Add-on Store**
+2. Click the **⋮** menu (top right) → **Repositories**
+3. Add `https://github.com/sneak-it/ha-rtl-fm-transcriber` and close the dialog
+4. Find "RTL-FM Transcriber" in the store and click **Install**
+
+Installing downloads a prebuilt image, so it takes seconds rather than minutes.
 
 ## Configuration
 
-| Option | Description | Default |
-|--------|-------------|---------|
-| `frequency` | FM frequency in MHz (e.g. 155.1075) | 155.1075 |
-| `squelch` | Noise threshold (0-200, higher = more selective) | 50 |
-| `chunk_duration` | Maximum transmission duration safety cap (seconds) | 15 |
-| `whisper_url` | Wyoming server URL (e.g. `tcp://host:10300`) | http://10.0.10.21:10300 |
-| `mqtt_host` | MQTT broker hostname | core-mosquitto |
-| `mqtt_port` | MQTT broker port | 1883 |
-| `mqtt_topic` | Topic for transcriptions | radio/transcription |
-| `mqtt_username` | MQTT username (optional) | |
-| `mqtt_password` | MQTT password (optional) | |
-| `vad_threshold` | RMS amplitude threshold for voice detection | 0.03 |
-| `vad_baseline_window` | Seconds of idle audio to track for baseline | 30 |
-| `gain` | RTL-SDR gain (number or "auto") | auto |
-| `ppm` | PPM correction for RTL-SDR clock drift (0-500) | 0 |
-| `bandpass_filter` | Enable voice bandpass filter (300-3000 Hz) | true |
-| `bandpass_low` | Bandpass filter low cutoff in Hz | 300 |
-| `bandpass_high` | Bandpass filter high cutoff in Hz | 3000 |
-| `debug_audio` | Save debug audio to /config/www/ | false |
-| `timezone` | Timezone for timestamps (IANA name) | America/New_York |
-| `silence_timeout` | Seconds of silence before transcription is sent | 2.0 |
-| `vad_warmup_ms` | Milliseconds to buffer before streaming (AGC stabilization) | 150 |
-| `min_transmission_duration` | Minimum transmission length to transcribe (seconds) | 0.3 |
-| `max_transmission_duration` | Maximum transmission length safety cap (seconds) | 120.0 |
-| `vad_recovery_seconds` | Silence duration before considering transmission ended (seconds) | 1.0 |
-| `audio_recording` | Enable audio recording for successful transcriptions | false |
-| `audio_retention_days` | Days to keep audio recordings | 7 |
-| `audio_max_files` | Maximum number of audio files (0 = unlimited) | 0 |
+Every option is documented in [DOCS.md](rtl-fm-transcriber/DOCS.md), which is
+also what the add-on's Documentation tab shows in Home Assistant.
 
-### Audio Recording
+## Repository layout
 
-When `audio_recording` is enabled, WAV audio files are saved for every successful transcription. Files are stored in `/config/www/radio-audio/` and served via Home Assistant's `/local/` path for playback.
+`repository.yaml` at the root marks this as an add-on repository; everything the
+add-on ships lives in [rtl-fm-transcriber/](rtl-fm-transcriber/), and the tests,
+lint config and workflows at the root are development-only.
 
-**Audio files are named using the format:** `YYYYMMDD-HHMMSS-XXXX.XX.wav` (16kHz, 16-bit, mono PCM).
+The operational code is `rtl-fm-transcriber/rtl_fm_transcriber/`, one concern per
+module; `transcriber.py` is a thin entry-point shim. Segmentation rules are a
+pure function in `transmission.py`, so they are tested against synthetic chunk
+sequences without an RTL-SDR dongle or a Wyoming server.
 
-**Playback in Lovelace:** Audio files can be played directly in the dashboard using the HTML5 `<audio>` element, or via any media player using the `media-source://media_source/local/radio-audio/<filename>.wav` URI scheme.
+## Development
 
-**Retention policy:** Old recordings are automatically cleaned up based on `audio_retention_days` and `audio_max_files` settings.
-
-### MQTT Output with Audio
-
-When audio recording is enabled, the MQTT payload includes additional fields:
-```json
-{
-  "text": "Unit 42 responding to Main Street",
-  "frequency": "155.1075",
-  "timestamp": "2026-01-25T18:15:00Z",
-  "audio_file": "radio-audio/20260125-181500-155_1075.wav",
-  "audio_url": "media-source://media_source/local/radio-audio/20260125-181500-155_1075.wav"
-}
+```bash
+pip install -r rtl-fm-transcriber/requirements.txt -r requirements-dev.txt
+ruff check .
+pytest -q
 ```
 
-### rtl_fm Parameters Explained
+## Releasing
 
-- **squelch**: Controls the noise threshold. Higher values require stronger signals to open the squelch. For public safety monitoring, start at 50 and adjust based on your environment (range 0-200).
-- **gain**: Use manual gain values for best results. Run `rtl_test` to find optimal gain for your dongle. Set to "auto" for automatic gain control.
-- **ppm**: RTL-SDR dongles have slight clock drift. Run `rtl_test -p` to measure your dongle's PPM offset and enter it here for accurate frequency tuning.
-- **bandpass_filter**: Removes low-frequency hum (below 300 Hz) and high-frequency static (above 3000 Hz) to improve transcription quality. This is recommended for emergency services monitoring.
+The Supervisor pulls the image tag matching `version` in
+`rtl-fm-transcriber/config.yaml`, so a version bump is only usable once its
+images exist:
 
-### Voice Activity Detection (VAD) and Streaming Transcription
+1. Bump `version` in `rtl-fm-transcriber/config.yaml` and update the changelog
+2. Merge to `main`
+3. Publish a GitHub release whose tag is that same version
 
-The add-on uses a baseline tracking algorithm with **streaming transcription** for real-time radio message segmentation. In RTL-SDR setups with automatic gain control (AGC), idle noise often has a **higher** RMS amplitude than active transmissions. When a strong signal arrives, AGC reduces gain, causing the RMS to drop.
-
-The system automatically tracks a baseline of idle noise RMS values and detects transmissions when the signal drops significantly below that baseline. Audio is streamed directly to the Wyoming server as it arrives - no more 15-second hard cuts mid-message.
-
-**Transmission state machine:**
-1. **IDLE** - Monitoring for voice activity
-2. **WARMUP** - Voice detected, buffering 150ms (AGC stabilization)
-3. **STREAMING** - Actively streaming audio to Wyoming
-4. **SILENCE_DETECTED** - Voice stopped, starting silence timer
-5. **WAITING_FOR_END** - Waiting for silence timeout to confirm end of transmission
-6. **TRANSCRIBING** - Sent AudioStop, waiting for final transcript
-
-**Recommended settings:**
-```yaml
-vad_threshold: 0.03
-vad_baseline_window: 30
-silence_timeout: 2.0
-vad_recovery_seconds: 1.0
-min_transmission_duration: 0.3
-max_transmission_duration: 120.0
-```
-
-With these settings:
-- The system collects ~30 seconds of idle noise RMS values for baseline
-- Voice is detected when RMS drops below `baseline - 0.03`
-- 150ms warmup buffer allows AGC to stabilize before streaming
-- 1.0s silence recovery timeout detects end of transmission
-- 2.0s final silence timeout confirms transmission end
-- Minimum 0.3s transmission filters out clicks/spurs
-- Maximum 120s safety cap prevents runaway transmissions
-
-### Wyoming Server Connection
-
-The add-on connects to the Wyoming server (faster-whisper) for real-time streaming transcription. Connection management includes:
-
-- **Connection timeout** — Connection attempts timeout after `wyoming_connection_timeout` seconds (default: 10s)
-- **Reconnection with exponential backoff** — If Wyoming is unavailable, reconnection attempts use 1s, 2s, 4s delays (max 3 attempts)
-- **Error classification** — Distinguishes between "connection refused" (server down), "connection timeout" (network issue), and "connection reset" (mid-stream disconnect)
-- **Graceful degradation** — If Wyoming is unavailable, the RTL-SDR pipeline continues running; transmissions are skipped until the server recovers
-
-**Recommended settings:**
-```yaml
-wyoming_connection_timeout: 10.0
-wyoming_read_timeout: 30.0
-wyoming_reconnect_max_attempts: 3
-wyoming_reconnect_delay: 1.0
-```
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `wyoming_connection_timeout` | 10.0 | Seconds to wait for Wyoming connection |
-| `wyoming_read_timeout` | 30.0 | Seconds to wait for transcript after AudioStop |
-| `wyoming_reconnect_max_attempts` | 3 | Max reconnection attempts per transmission |
-| `wyoming_reconnect_delay` | 1.0 | Initial delay between reconnection attempts (seconds) |
-
-## MQTT Output
-
-Published to `radio/transcription`:
-```json
-{
-  "text": "Unit 42 responding to Main Street",
-  "frequency": "155.1075",
-  "timestamp": "2026-01-25T18:15:00Z"
-}
-```
-
-## Home Assistant Sensor
-
-Add to `configuration.yaml`:
-```yaml
-mqtt:
-  sensor:
-    - name: "Radio Transcription"
-      state_topic: "radio/transcription"
-      value_template: "{{ value_json.text[:255] }}"
-      json_attributes_topic: "radio/transcription"
-```
-
-## Example Automation
-
-```yaml
-automation:
-  - alias: "Radio Keyword Alert"
-    trigger:
-      - platform: mqtt
-        topic: radio/transcription
-    condition:
-      - condition: template
-        value_template: "{{ 'fire' in trigger.payload_json.text|lower }}"
-    action:
-      - service: notify.mobile_app
-        data:
-          title: "🚒 Radio Alert"
-          message: "{{ trigger.payload_json.text }}"
-```
+The release workflow refuses to run if the tag and the manifest version differ,
+since publishing a mismatch would leave users unable to install or update.

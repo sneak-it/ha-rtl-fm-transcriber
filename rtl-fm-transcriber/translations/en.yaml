@@ -1,0 +1,89 @@
+configuration:
+  frequency:
+    name: Frequency (MHz)
+    description: Frequency to monitor, e.g. 155.1075.
+  squelch:
+    name: Squelch
+    description: 'Carrier detection threshold (0-200). This is the sensitivity knob: raise it to ignore
+      noise, lower it to catch weaker transmissions.'
+  whisper_url:
+    name: Wyoming server
+    description: Address of the Wyoming (faster-whisper) server, e.g. 10.0.0.5:10300.
+  mqtt_host:
+    name: MQTT broker host
+    description: Hostname of the MQTT broker.
+  mqtt_port:
+    name: MQTT broker port
+    description: Port of the MQTT broker.
+  mqtt_topic:
+    name: MQTT topic
+    description: Topic transcriptions are published to.
+  mqtt_username:
+    name: MQTT username
+    description: Leave blank for an anonymous connection.
+  mqtt_password:
+    name: MQTT password
+    description: Password for the MQTT username.
+  mqtt_tls:
+    name: Use TLS for MQTT
+    description: Connect to the broker over TLS.
+  mqtt_tls_ca:
+    name: MQTT CA certificate
+    description: Path to a CA certificate. Leave blank to use the system trust store.
+  gain:
+    name: Tuner gain
+    description: RTL-SDR gain as a number, or the word auto. Run rtl_test to find a good value.
+  ppm:
+    name: PPM correction
+    description: Clock drift correction for your dongle, may be negative. Measure with rtl_test -p.
+  bandpass_filter:
+    name: Voice bandpass filter
+    description: Remove rumble and hiss outside the voice band.
+  bandpass_low:
+    name: Bandpass low cutoff (Hz)
+    description: Frequencies below this are removed.
+  bandpass_high:
+    name: Bandpass high cutoff (Hz)
+    description: Frequencies above this are removed.
+  timezone:
+    name: Timezone
+    description: IANA timezone name used for timestamps and log times, e.g. America/New_York.
+  silence_timeout:
+    name: Silence timeout (s)
+    description: Seconds of silence that end a transmission.
+  vad_warmup_ms:
+    name: Warmup buffer (ms)
+    description: Audio buffered before the transcription session opens, so the start of a transmission
+      is not lost.
+  min_transmission_duration:
+    name: Minimum transmission (s)
+    description: Shorter transmissions are discarded as clicks or spurs.
+  max_transmission_duration:
+    name: Maximum transmission (s)
+    description: A carrier open longer than this is split into consecutive transmissions.
+  wyoming_connection_timeout:
+    name: Wyoming connect timeout (s)
+    description: How long to wait when opening a connection.
+  wyoming_read_timeout:
+    name: Wyoming transcript timeout (s)
+    description: How long to wait for a transcript after a transmission ends.
+  wyoming_reconnect_max_attempts:
+    name: Wyoming reconnect attempts
+    description: Connection attempts before giving up until the next transmission.
+  wyoming_reconnect_delay:
+    name: Wyoming reconnect delay (s)
+    description: Base delay for the exponential backoff between attempts.
+  audio_recording:
+    name: Save audio recordings
+    description: Write a WAV file for every transcription.
+  audio_public_www:
+    name: Store recordings in the Home Assistant www folder
+    description: 'WARNING: this path is served at /local/ with no authentication, so anyone who can reach
+      Home Assistant can download recordings. Only enable it if you need inline playback in a markdown
+      card. The default stores them under /media instead.'
+  audio_retention_days:
+    name: Retention (days)
+    description: Recordings older than this are deleted.
+  audio_max_files:
+    name: Maximum recordings
+    description: Oldest recordings are deleted past this count. 0 means unlimited.

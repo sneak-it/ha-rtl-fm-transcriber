@@ -1,0 +1,25 @@
+[tool.ruff]
+# Matches the Python in the base images the add-on ships on (see build.json).
+target-version = "py314"
+line-length = 100
+exclude = [".ruff_cache", "__pycache__"]
+# Where first-party code lives, so import sorting keeps rtl_fm_transcriber out of
+# the third-party group now that it sits inside the add-on folder.
+src = [".", "rtl-fm-transcriber"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "SIM", "ASYNC", "B", "RUF", "PLW", "BLE", "S"]
+# E501: existing log strings run long; not worth reflowing.
+# ASYNC109: the Wyoming connect/stop_session timeouts are part of their contract.
+ignore = ["E501", "ASYNC109"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert on broad failure handling and use asserts by design.
+"tests/*" = ["PLW", "S101", "S105", "BLE", "SLF001"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# The add-on is not installed as a package, so put its folder on sys.path for
+# imports of rtl_fm_transcriber. Without this, bare "pytest" cannot find it.
+pythonpath = ["rtl-fm-transcriber"]

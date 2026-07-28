@@ -1,0 +1,87 @@
+name: "RTL-FM Transcriber"
+version: "1.5.0"
+slug: rtl-fm-transcriber
+description: "Captures FM radio via RTL-SDR, transcribes with Whisper, publishes to MQTT"
+url: "https://github.com/sneak-it/ha-rtl-fm-transcriber"
+image: "ghcr.io/sneak-it/{arch}-rtl-fm-transcriber"
+init: false
+arch:
+  - amd64
+  - aarch64
+startup: application
+boot: auto
+# Start after the broker, and take its credentials from the Supervisor.
+services:
+  - mqtt:need
+usb: true
+udev: true
+devices:
+  - /dev/bus/usb
+map:
+  - media:rw
+  # Home Assistant's config directory, mounted at /homeassistant. Only used for
+  # the audio_public_www option, which writes into its www folder. The legacy
+  # "config" map was deprecated in Supervisor 2023.11, hence the version pin.
+  - homeassistant_config:rw
+homeassistant: "2023.11.0"
+options:
+  frequency: 155.1075
+  squelch: 50
+  whisper_url: "tcp://homeassistant.local:10300"
+  mqtt_host: "core-mosquitto"
+  mqtt_port: 1883
+  mqtt_topic: "radio/transcription"
+  mqtt_username: ""
+  mqtt_password: ""
+  mqtt_tls: false
+  mqtt_tls_ca: ""
+  gain: "auto"
+  ppm: 0
+  bandpass_filter: true
+  bandpass_low: 300
+  bandpass_high: 3000
+  timezone: "UTC"
+  # Streaming segmentation options
+  silence_timeout: 2.0
+  vad_warmup_ms: 150
+  min_transmission_duration: 0.3
+  max_transmission_duration: 120.0
+  # Wyoming connection settings
+  wyoming_connection_timeout: 10.0
+  wyoming_read_timeout: 30.0
+  wyoming_reconnect_max_attempts: 3
+  wyoming_reconnect_delay: 1.0
+  # Audio recording settings
+  audio_recording: false
+  audio_public_www: false
+  audio_retention_days: 7
+  audio_max_files: 0
+schema:
+  frequency: float(24,1766)
+  squelch: int(0,200)
+  whisper_url: str
+  mqtt_host: str
+  mqtt_port: int(1,65535)
+  mqtt_topic: str
+  mqtt_username: str?
+  mqtt_password: password?
+  mqtt_tls: bool
+  mqtt_tls_ca: str?
+  gain: str?
+  ppm: int(-500,500)
+  bandpass_filter: bool
+  bandpass_low: int(100,5000)
+  bandpass_high: int(1000,12000)
+  timezone: str?
+  silence_timeout: float(0.2,30.0)
+  vad_warmup_ms: int(50,1000)
+  min_transmission_duration: float(0.05,10.0)
+  max_transmission_duration: float(1.0,600.0)
+  wyoming_connection_timeout: float(1.0,120.0)
+  wyoming_read_timeout: float(1.0,300.0)
+  wyoming_reconnect_max_attempts: int(1,10)
+  wyoming_reconnect_delay: float(0.5,10.0)
+  audio_recording: bool
+  audio_public_www: bool
+  audio_retention_days: int(1,365)
+  audio_max_files: int(0,10000)
