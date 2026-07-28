@@ -119,6 +119,8 @@ before updating.
 - Roughly 300 lines of never-called code removed.
 - `ppm` accepts negative values, which cheap dongles commonly need.
 - The broker password no longer renders in clear text in the configuration UI.
+- Base images updated to Alpine 3.24, which moves the runtime from Python 3.12
+  to 3.14. CI tests on the same version.
 
 ## 1.4.0
 

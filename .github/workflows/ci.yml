@@ -12,6 +12,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
+          # Matches the Python in the Alpine 3.24 base images the add-on ships on
+          # (see build.json). Bump both together.
           python-version: "3.14"
       - name: Install dependencies
         run: |

@@ -1,5 +1,7 @@
 """Wyoming connection lifecycle tests: timeouts, socket closure, retry timing."""
 
+from __future__ import annotations
+
 import asyncio
 import typing
 
@@ -12,7 +14,7 @@ from rtl_fm_transcriber.wyoming_client import WyomingStreamingClient
 class FakeTcpClient:
     """Stands in for AsyncTcpClient, recording enter/exit calls."""
 
-    instances: typing.ClassVar[list["FakeTcpClient"]] = []
+    instances: typing.ClassVar[list[FakeTcpClient]] = []
 
     def __init__(self, host, port, enter_delay=0.0, fail=None):
         self.host = host
