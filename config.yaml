@@ -6,7 +6,6 @@ init: false
 arch:
   - amd64
   - aarch64
-  - armv7
 startup: application
 boot: auto
 # Start after the broker, and take its credentials from the Supervisor.

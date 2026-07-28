@@ -1,5 +1,6 @@
 """Option loading, validation, and the config.yaml/code contract."""
 
+import json
 import pathlib
 
 import pytest
@@ -56,6 +57,16 @@ def test_manifest_and_code_defaults_agree():
 
 def test_every_option_has_a_schema_entry():
     assert set(MANIFEST["options"]) == set(MANIFEST["schema"])
+
+
+def test_declared_arches_have_a_base_image():
+    """Every arch in config.yaml needs a build.json entry, and vice versa.
+
+    An arch declared without a base image fails at build time on the user's
+    machine, not here.
+    """
+    build = json.loads((REPO / "build.json").read_text())
+    assert set(MANIFEST["arch"]) == set(build["build_from"])
 
 
 def test_password_uses_the_password_schema_type():

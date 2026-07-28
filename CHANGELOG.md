@@ -32,6 +32,10 @@ before updating.
   discovery payload is cleared on startup so Home Assistant drops the stale
   entity rather than leaving an orphan.
 - **`host_network` removed.** The add-on only makes outbound connections.
+- **`armv7` is no longer a supported architecture.** Home Assistant stopped
+  publishing 32-bit ARM base images after Alpine 3.22 and its build tooling only
+  accepts `amd64` and `aarch64`, so the add-on cannot be built for armv7 on a
+  current base. 64-bit installs are unaffected.
 - **Home Assistant 2023.11 or newer is now required** (declared via the
   `homeassistant` key). The deprecated `config` folder mapping is replaced with
   `homeassistant_config`, which the Supervisor mounts at `/homeassistant`. Only
@@ -114,7 +118,7 @@ before updating.
   localhost.
 - An AppArmor profile, pinned dependencies and pinned base images.
 - `DOCS.md`, `translations/en.yaml` for the options UI, and CI running lint,
-  tests and an add-on build for all three architectures.
+  tests and an add-on image build per supported architecture.
 
 ### Changed
 
