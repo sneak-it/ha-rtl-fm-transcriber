@@ -1,3 +1,10 @@
+# check=skip=InvalidDefaultArgInFrom
+
+# BUILD_FROM is required and deliberately has no default: the Supervisor passes
+# the base image for the machine's architecture, from build.json. A default would
+# have to name one architecture and would silently build the wrong base if the
+# arg were ever missing, so failing loudly is better. The directive above must
+# stay on the first line to take effect.
 ARG BUILD_FROM
 FROM $BUILD_FROM
 

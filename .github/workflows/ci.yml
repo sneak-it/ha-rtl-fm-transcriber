@@ -17,7 +17,7 @@ jobs:
           python-version: "3.14"
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt -r requirements-dev.txt
+          pip install -r rtl-fm-transcriber/requirements.txt -r requirements-dev.txt
       - name: Ruff
         run: ruff check .
       - name: Tests
@@ -49,11 +49,11 @@ jobs:
       - name: Resolve base image for ${{ matrix.arch }}
         id: base
         run: |
-          echo "image=$(jq -er '.build_from["${{ matrix.arch }}"]' build.json)" >> "$GITHUB_OUTPUT"
+          echo "image=$(jq -er '.build_from["${{ matrix.arch }}"]' rtl-fm-transcriber/build.json)" >> "$GITHUB_OUTPUT"
       - name: Build ${{ matrix.arch }} add-on image
         uses: docker/build-push-action@v7
         with:
-          context: .
+          context: ./rtl-fm-transcriber
           platforms: ${{ matrix.platform }}
           push: false
           build-args: |

@@ -3,6 +3,9 @@
 target-version = "py314"
 line-length = 100
 exclude = [".ruff_cache", "__pycache__"]
+# Where first-party code lives, so import sorting keeps rtl_fm_transcriber out of
+# the third-party group now that it sits inside the add-on folder.
+src = [".", "rtl-fm-transcriber"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "SIM", "ASYNC", "B", "RUF", "PLW", "BLE", "S"]
@@ -17,7 +20,6 @@ ignore = ["E501", "ASYNC109"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-# The add-on is not installed as a package, so put the repo root on sys.path
-# for imports of rtl_fm_transcriber. Without this, only "python -m pytest"
-# works (it adds the working directory implicitly) and bare "pytest" fails.
-pythonpath = ["."]
+# The add-on is not installed as a package, so put its folder on sys.path for
+# imports of rtl_fm_transcriber. Without this, bare "pytest" cannot find it.
+pythonpath = ["rtl-fm-transcriber"]

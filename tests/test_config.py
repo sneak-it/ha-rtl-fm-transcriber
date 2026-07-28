@@ -15,8 +15,8 @@ from rtl_fm_transcriber.config import (
 )
 from rtl_fm_transcriber.recording import MEDIA_DIR, WWW_DIR, audio_dir, audio_url
 
-REPO = pathlib.Path(__file__).resolve().parent.parent
-MANIFEST = yaml.safe_load((REPO / "config.yaml").read_text())
+ADDON = pathlib.Path(__file__).resolve().parent.parent / "rtl-fm-transcriber"
+MANIFEST = yaml.safe_load((ADDON / "config.yaml").read_text())
 
 
 @pytest.mark.parametrize(
@@ -65,7 +65,7 @@ def test_declared_arches_have_a_base_image():
     An arch declared without a base image fails at build time on the user's
     machine, not here.
     """
-    build = json.loads((REPO / "build.json").read_text())
+    build = json.loads((ADDON / "build.json").read_text())
     assert set(MANIFEST["arch"]) == set(build["build_from"])
 
 

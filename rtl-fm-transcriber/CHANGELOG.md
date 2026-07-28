@@ -32,6 +32,12 @@ before updating.
   discovery payload is cleared on startup so Home Assistant drops the stale
   entity rather than leaving an orphan.
 - **`host_network` removed.** The add-on only makes outbound connections.
+- **Installable as a custom add-on repository.** The repository now has the
+  `repository.yaml` the Supervisor requires, and the add-on lives in its own
+  folder alongside it. Add the GitHub URL under Settings, Add-ons, Add-on store,
+  Repositories.
+- **The add-on now installs from prebuilt images** published to GHCR per release,
+  instead of being built on each user's machine.
 - **`armv7` is no longer a supported architecture.** Home Assistant stopped
   publishing 32-bit ARM base images after Alpine 3.22 and its build tooling only
   accepts `amd64` and `aarch64`, so the add-on cannot be built for armv7 on a
