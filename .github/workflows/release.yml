@@ -1,0 +1,90 @@
+name: Release
+
+# Publishes the per-architecture images the Supervisor pulls at install time.
+# The tag it pulls is the version in rtl-fm-transcriber/config.yaml, so the
+# release and that version must agree; the first job enforces it.
+#
+# The images must be publicly visible on GHCR or installs fail with an auth
+# error. GHCR packages start out private, so set each one to public once after
+# the first successful run (Profile -> Packages -> package -> settings).
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to publish (must match config.yaml)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  init:
+    name: Check version and prepare matrix
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Release must match the add-on version
+        id: check
+        env:
+          REQUESTED: ${{ github.event.release.tag_name || inputs.version }}
+        run: |
+          manifest="$(python3 -c "
+          import pathlib, re
+          text = pathlib.Path('rtl-fm-transcriber/config.yaml').read_text()
+          print(re.search(r'^version:\s*\"?([^\"\s]+)', text, re.M).group(1))
+          ")"
+          requested="${REQUESTED#v}"
+          if [ "$requested" != "$manifest" ]; then
+            echo "::error::Release '$requested' does not match config.yaml version" \
+                 "'$manifest'. The Supervisor pulls the config.yaml version, so" \
+                 "publishing this would leave users unable to install or update."
+            exit 1
+          fi
+          echo "version=$manifest" >> "$GITHUB_OUTPUT"
+      - name: Build matrix
+        id: matrix
+        uses: home-assistant/builder/actions/prepare-multi-arch-matrix@2026.06.0
+        with:
+          architectures: '["amd64", "aarch64"]'
+          image-name: rtl-fm-transcriber
+
+  publish:
+    name: Publish ${{ matrix.arch }}
+    needs: init
+    # amd64 builds on an x86 runner, aarch64 on a native ARM runner, per the
+    # matrix above. The builder action does not emulate.
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      packages: write # push images to GHCR
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.init.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Resolve base image for ${{ matrix.arch }}
+        id: base
+        run: |
+          echo "image=$(jq -er '.build_from["${{ matrix.arch }}"]' rtl-fm-transcriber/build.json)" >> "$GITHUB_OUTPUT"
+      - name: Build and push ${{ matrix.arch }}
+        uses: home-assistant/builder/actions/build-image@2026.06.0
+        with:
+          arch: ${{ matrix.arch }}
+          context: ./rtl-fm-transcriber
+          image: ${{ matrix.image }}
+          image-tags: |
+            ${{ needs.init.outputs.version }}
+            latest
+          version: ${{ needs.init.outputs.version }}
+          push: "true"
+          # Signing covers Home Assistant's own image chain; the Supervisor does
+          # not verify signatures on third-party add-on images.
+          cosign: "false"
+          container-registry-password: ${{ secrets.GITHUB_TOKEN }}
+          build-args: |
+            BUILD_FROM=${{ steps.base.outputs.image }}

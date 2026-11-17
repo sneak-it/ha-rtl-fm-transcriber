@@ -1,0 +1,4 @@
+# The add-on runs in a Linux container; CRLF in run.sh or transcriber.py breaks it.
+* text=auto eol=lf
+*.png binary
+*.jpg binary

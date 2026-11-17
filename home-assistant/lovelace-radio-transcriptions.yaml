@@ -1,6 +1,12 @@
 # ============================================================
 # RTL-FM Transcription Stream - Lovelace Dashboard Card
 # ============================================================
+#
+# The inline <audio> player below needs recordings to be reachable at /local/,
+# so it only works with audio_public_www: true. That path is served WITHOUT
+# authentication; with the default (audio_public_www: false) recordings live
+# under /media and the payload's audio_url is a media-source:// URI, which you
+# play through the Media browser or media_player.play_media instead.
 
 type: vertical-stack
 cards:
@@ -56,10 +62,18 @@ cards:
 
       {% if entry.audio_file | default(false, true) %}
 
-      <audio controls src="/local/radio-audio/{{ entry.audio_file.split('/') |
-      last }}" type="audio/wav" preload="metadata">
+      {% if entry.audio_url | default('', true) is search('^/local/') %}
+
+      <audio controls src="{{ entry.audio_url }}" type="audio/wav"
+      preload="metadata">
         Your browser does not support the audio element.
       </audio>
+
+      {% else %}
+
+      `{{ entry.audio_file }}` (open via the Media browser)
+
+      {% endif %}
 
       {% endif %}
 

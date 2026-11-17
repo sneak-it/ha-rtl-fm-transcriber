@@ -1,0 +1,46 @@
+#include <tunables/global>
+
+profile rtl_fm_transcriber flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+  #include <abstractions/python>
+
+  # Capabilities the container legitimately needs
+  file,
+  signal (send) set=(kill,term,int,hup,cont),
+  network inet stream,
+  network inet6 stream,
+  # DNS lookups for the broker and Wyoming hosts
+  network inet dgram,
+  network inet6 dgram,
+  # libusb opens a netlink socket for hotplug events and fails to start without it
+  network netlink raw,
+
+  # S6 / add-on startup
+  /run.sh r,
+  /bin/** ix,
+  /usr/bin/** ix,
+  /usr/lib/** mr,
+  /lib/** mr,
+
+  # Python and the add-on itself
+  /usr/bin/python3* ix,
+  /app/** r,
+
+  # Add-on options
+  /data/** rw,
+
+  # Recordings
+  /media/** rw,
+  /homeassistant/** rw,
+
+  # USB access for the RTL-SDR dongle
+  /dev/bus/usb/** rw,
+  /sys/bus/usb/** r,
+  /sys/devices/** r,
+  /run/udev/data/** r,
+
+  # Deny everything sensitive
+  deny /etc/shadow rwklx,
+  deny /root/** rwklx,
+  deny /proc/sys/kernel/** wklx,
+}

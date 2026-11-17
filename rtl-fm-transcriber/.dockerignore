@@ -1,0 +1,6 @@
+# The build context is this folder only; dev tooling lives at the repo root.
+__pycache__/
+*.pyc
+.ruff_cache/
+CHANGELOG.md
+DOCS.md
