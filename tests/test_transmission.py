@@ -75,9 +75,8 @@ def test_streaming_streams_voice():
 def test_silence_opens_the_window_then_ends():
     """Silence must end a transmission in the normal data path.
 
-    Regression: WAITING_FOR_END was checked but never assigned, so the only
-    working end path was a read timeout that -E pad makes rare, and every
-    transmission ran to the 120s cap.
+    Regression: WAITING_FOR_END was checked but never assigned, so silence
+    chunks never ended a transmission.
     """
     assert decide(STREAMING, SILENT, silence_elapsed=None) == HOLD
     assert decide(WAITING_FOR_END, SILENT, silence_elapsed=0.5, silence_timeout=2.0) == HOLD
@@ -117,6 +116,8 @@ class TestChunkSequences:
         for voice, now in sequence:
             action = t.next_action(voice, now, incoming=len(CHUNK))
             actions.append(action)
+            if voice:
+                t.voiced_bytes += len(CHUNK)
             if action == START:
                 t.begin(CHUNK, now)
             elif action == BUFFER:
@@ -190,6 +191,20 @@ class TestChunkSequences:
         t, actions = self._run([(SILENT, i * 0.13) for i in range(50)])
         assert set(actions) == {IGNORE}
         assert t.state == IDLE
+
+    def test_audio_seconds_excludes_the_silence_that_ended_it(self):
+        """min_transmission_duration is compared against voiced audio.
+
+        Regression: it was compared against wall-clock duration, which includes
+        the silence timeout, so no transmission was ever short enough to discard.
+        """
+        seq = [(VOICE, 0.0), (VOICE, 0.13), (SILENT, 0.26), (SILENT, 2.5)]
+        t, actions = self._run(seq)
+        assert actions[-1] == END
+        assert t.duration == pytest.approx(2.5)
+        assert t.audio_seconds == pytest.approx(0.256)
+        t.reset()
+        assert t.audio_seconds == 0.0
 
     def test_duration_freezes_at_end_time(self):
         t, _ = self._run([(VOICE, 0.0), (VOICE, 0.13)])

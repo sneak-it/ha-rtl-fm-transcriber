@@ -58,7 +58,7 @@ options:
   audio_max_files: 0
 schema:
   frequency: float(24,1766)
-  squelch: int(0,200)
+  squelch: int(1,200)
   whisper_url: str
   mqtt_host: str
   mqtt_port: int(1,65535)
@@ -71,7 +71,7 @@ schema:
   ppm: int(-500,500)
   bandpass_filter: bool
   bandpass_low: int(100,5000)
-  bandpass_high: int(1000,12000)
+  bandpass_high: int(1000,5999)
   timezone: str?
   silence_timeout: float(0.2,30.0)
   vad_warmup_ms: int(50,1000)

@@ -15,22 +15,22 @@ folder mapping, which replaced the deprecated `config` mapping in Supervisor
 | Option | Description | Default |
 |--------|-------------|---------|
 | `frequency` | FM frequency in MHz (e.g. 155.1075) | 155.1075 |
-| `squelch` | Carrier detection threshold (0-200, higher = more selective). This is the sensitivity knob for transmission detection. | 50 |
-| `whisper_url` | Wyoming server URL (e.g. `tcp://host:10300`) | http://10.0.10.21:10300 |
+| `squelch` | Carrier detection threshold (1-200, higher = more selective). This is the sensitivity knob for transmission detection. | 50 |
+| `whisper_url` | Wyoming server URL (e.g. `tcp://host:10300`) | tcp://homeassistant.local:10300 |
 | `mqtt_host` | MQTT broker hostname | core-mosquitto |
 | `mqtt_port` | MQTT broker port | 1883 |
 | `mqtt_topic` | Topic for transcriptions | radio/transcription |
 | `mqtt_username` | MQTT username (optional) | |
 | `mqtt_password` | MQTT password (optional) | |
 | `gain` | RTL-SDR gain (number or "auto") | auto |
-| `ppm` | PPM correction for RTL-SDR clock drift (0-500) | 0 |
+| `ppm` | PPM correction for RTL-SDR clock drift (-500 to 500) | 0 |
 | `bandpass_filter` | Enable voice bandpass filter (300-3000 Hz) | true |
 | `bandpass_low` | Bandpass filter low cutoff in Hz | 300 |
-| `bandpass_high` | Bandpass filter high cutoff in Hz | 3000 |
+| `bandpass_high` | Bandpass filter high cutoff in Hz (below 6000, half the 12 kHz capture rate) | 3000 |
 | `timezone` | Timezone for timestamps (IANA name) | UTC |
 | `silence_timeout` | Seconds of silence that ends a transmission | 2.0 |
 | `vad_warmup_ms` | Milliseconds to buffer before streaming (AGC stabilization) | 150 |
-| `min_transmission_duration` | Minimum transmission length to transcribe (seconds) | 0.3 |
+| `min_transmission_duration` | Minimum voiced audio to transcribe (seconds); shorter transmissions are discarded | 0.3 |
 | `max_transmission_duration` | Maximum transmission length safety cap (seconds) | 120.0 |
 | `audio_recording` | Enable audio recording for successful transcriptions | false |
 | `audio_public_www` | Write recordings to the unauthenticated `/local/` path instead of `/media` (see warning below) | false |
@@ -58,7 +58,7 @@ When audio recording is enabled, the MQTT payload includes additional fields:
 {
   "text": "Unit 42 responding to Main Street",
   "frequency": "155.1075",
-  "timestamp": "2026-01-25T18:15:00Z",
+  "timestamp": "2026-01-25T18:15:00+00:00",
   "audio_file": "radio-audio/20260125-181500-155_1075.wav",
   "audio_url": "media-source://media_source/local/radio-audio/20260125-181500-155_1075.wav"
 }
@@ -66,18 +66,21 @@ When audio recording is enabled, the MQTT payload includes additional fields:
 
 ### rtl_fm Parameters Explained
 
-- **squelch**: Controls the noise threshold. Higher values require stronger signals to open the squelch. For public safety monitoring, start at 50 and adjust based on your environment (range 0-200).
+- **squelch**: Controls the noise threshold. Higher values require stronger signals to open the squelch. For public safety monitoring, start at 50 and adjust based on your environment (range 1-200). 0 would turn the squelch off, which the add-on rejects because the squelch is what detects a transmission.
 - **gain**: Use manual gain values for best results. Run `rtl_test` to find optimal gain for your dongle. Set to "auto" for automatic gain control.
 - **ppm**: RTL-SDR dongles have slight clock drift. Run `rtl_test -p` to measure your dongle's PPM offset and enter it here for accurate frequency tuning.
 - **bandpass_filter**: Removes low-frequency hum (below 300 Hz) and high-frequency static (above 3000 Hz) to improve transcription quality. This is recommended for emergency services monitoring.
 
 ### Voice Activity Detection (VAD) and Streaming Transcription
 
-Detection is squelch-gated. `rtl_fm` runs with `-l <squelch> -E pad`, so while
-the squelch is closed it emits zero-padded samples, and when a carrier opens it
-emits real audio. A chunk counts as voice when it carries real audio rather than
-padding, which means `squelch` is the sensitivity knob: raise it to ignore weak
+Detection is squelch-gated. `rtl_fm` runs with `-l <squelch> -t <blocks>`, so
+while the squelch is closed it writes zeros, and when a carrier opens it writes
+real audio. A chunk counts as voice when it carries real audio rather than
+zeros, which means `squelch` is the sensitivity knob: raise it to ignore weak
 signals and noise, lower it to catch weaker transmissions.
+
+`rtl_fm` decides the squelch once per block of about 130 ms, so that is the
+resolution of every timing option below.
 
 Audio is streamed to the Wyoming server as it arrives, so there are no hard cuts
 mid-message.
@@ -108,7 +111,8 @@ With these settings:
 - 150ms warmup buffer is captured before the Wyoming session opens, so the start
   of the transmission is not lost
 - 2.0s of silence ends a transmission
-- Minimum 0.3s transmission filters out clicks and spurs
+- Minimum 0.3s of voiced audio filters out clicks and spurs before they reach
+  the speech-to-text server
 - Maximum 120s safety cap prevents a stuck carrier from streaming forever
 
 ### Wyoming Server Connection
@@ -142,9 +146,11 @@ Published to `radio/transcription`:
 {
   "text": "Unit 42 responding to Main Street",
   "frequency": "155.1075",
-  "timestamp": "2026-01-25T18:15:00Z"
+  "timestamp": "2026-01-25T18:15:00+00:00"
 }
 ```
+
+`timestamp` is when the transmission began, in the configured timezone.
 
 ## Home Assistant Sensor
 

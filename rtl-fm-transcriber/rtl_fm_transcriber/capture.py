@@ -8,15 +8,16 @@ import os
 import time
 
 from .audio import compute_rms
-from .config import parse_wyoming_url
+from .config import CAPTURE_RATE, parse_wyoming_url
 from .filters import is_hallucination
 from .mqtt import safe_publish
 from .pipeline import cleanup_pipeline, read_stderr_pipeline, start_pipeline
 from .recording import audio_dir, audio_url, cleanup_old_recordings, save_audio_recording
-from .timeutil import format_timestamp, now_local
+from .timeutil import local_time
 from .transmission import (
     ACTIVE_STATES,
     BUFFER,
+    BYTES_PER_SEC,
     END,
     HOLD,
     IGNORE,
@@ -42,17 +43,15 @@ READ_TIMEOUT = 0.05
 FINALIZER_DRAIN_TIMEOUT = 35.0
 # A pipeline must run at least this long to count as healthy for backoff.
 HEALTHY_RUNTIME = 30.0
+# Chunks arrive about every 130 ms; a gap this long mid-transmission is a stalled stream.
+STALL_SECONDS = 1.0
 
 
 async def capture_loop(config, mqtt_client):
     """Supervise the capture pipeline, restarting it with backoff on failure."""
     frequency_hz = round(config["frequency"] * 1_000_000)
     sample_rate = 16000
-    # 12000 Hz sample rate for narrowband FM (12.5 kHz public safety channels)
-    capture_rate = 12000
-
-    bytes_per_sec = sample_rate * 2  # 16-bit mono
-    warmup_bytes = int(config.get("vad_warmup_ms", 150) / 1000.0 * bytes_per_sec)
+    warmup_bytes = int(config.get("vad_warmup_ms", 150) / 1000.0 * BYTES_PER_SEC)
 
     logger.info("Starting persistent capture with streaming transcription")
     logger.info(f"  Frequency: {config['frequency']} MHz")
@@ -65,7 +64,7 @@ async def capture_loop(config, mqtt_client):
 
     while True:
         processes = await start_pipeline(
-            config, frequency_hz, sample_rate, capture_rate
+            config, frequency_hz, sample_rate, CAPTURE_RATE
         )
 
         if processes is None:
@@ -81,8 +80,8 @@ async def capture_loop(config, mqtt_client):
             except asyncio.CancelledError:
                 await cleanup_pipeline(rtl_proc, sox_proc)
                 raise
-            except Exception as e:  # noqa: BLE001 - supervisor boundary; restart below
-                logger.error(f"Capture loop error: {e}")
+            except Exception:  # supervisor boundary; restart below
+                logger.exception("Capture loop error")
             finally:
                 ran_for = time.monotonic() - started
             logger.error(
@@ -91,10 +90,8 @@ async def capture_loop(config, mqtt_client):
             )
             await cleanup_pipeline(rtl_proc, sox_proc)
 
-        # Only a pipeline that actually ran counts as healthy. Resetting on a
-        # successful spawn instead meant a missing or claimed dongle, where
-        # rtl_fm launches fine and exits immediately, looped at 1s forever and
-        # never reached the backoff.
+        # Only a pipeline that ran counts as healthy: with a missing or claimed
+        # dongle rtl_fm spawns fine and exits at once.
         if ran_for >= HEALTHY_RUNTIME:
             logger.info(f"Pipeline ran {ran_for:.0f}s before failing, resetting backoff")
             retry_count = 0
@@ -139,6 +136,7 @@ async def _run_pipeline(rtl_proc, sox_proc, config, mqtt_client, warmup_bytes):
     wyoming = WyomingStreamingClient()
     finalizers: set[asyncio.Task] = set()
     stderr_task = asyncio.create_task(read_stderr_pipeline(rtl_proc, sox_proc))
+    last_data = time.time()
 
     try:
         while True:
@@ -149,9 +147,14 @@ async def _run_pipeline(rtl_proc, sox_proc, config, mqtt_client, warmup_bytes):
             except TimeoutError:
                 # No data available. The same transition table decides, but only
                 # END is actionable with no chunk to dispatch.
+                now = time.time()
+                if transmission.state == STREAMING and now - last_data >= STALL_SECONDS:
+                    # A stalled stream is silence since the last chunk.
+                    transmission.silence_start = last_data
+                    transmission.state = WAITING_FOR_END
                 if (
                     transmission.state in ACTIVE_STATES
-                    and transmission.next_action(False, time.time()) == END
+                    and transmission.next_action(False, now) == END
                 ):
                     wyoming = await _finish(
                         transmission, wyoming, config, mqtt_client, finalizers
@@ -162,9 +165,11 @@ async def _run_pipeline(rtl_proc, sox_proc, config, mqtt_client, warmup_bytes):
                 logger.error("Audio pipeline died (EOF from sox)")
                 return
 
-            now = time.time()
+            now = last_data = time.time()
             voice = is_voice(compute_rms(chunk))
             action = transmission.next_action(voice, now, incoming=len(chunk))
+            if voice:
+                transmission.voiced_bytes += len(chunk)
 
             if action == IGNORE:
                 continue
@@ -288,6 +293,7 @@ async def _send_chunk(
 
     try:
         await wyoming.start_session(wyoming.client)
+        await wyoming.send_chunk(chunk)
     except Exception as e:  # noqa: BLE001 - skip this transmission, keep capturing
         logger.error(f"[Wyoming] Failed to restart session after reconnect: {e}")
         return False
@@ -313,12 +319,14 @@ async def _finish(
     next transmission.
     """
     transmission.end_time = time.time()
-    duration = transmission.duration
-    if duration >= transmission.max_duration:
+    if transmission.duration >= transmission.max_duration:
         reason = f"max duration ({transmission.max_duration}s)"
     else:
         reason = f"silence timeout ({transmission.silence_timeout}s)"
-    logger.info(f"[VAD] Transmission ended on {reason}, duration {duration:.1f}s")
+    # Voiced audio, not wall-clock: the latter includes the silence timeout.
+    duration = transmission.audio_seconds
+    started = transmission.start_time
+    logger.info(f"[VAD] Transmission ended on {reason}, {duration:.1f}s of audio")
 
     audio = bytes(transmission.warmup_buffer) + bytes(transmission.recording_buffer)
     session_open = wyoming.is_active
@@ -340,7 +348,7 @@ async def _finish(
         return WyomingStreamingClient()
 
     task = asyncio.create_task(
-        _transcribe_and_publish(wyoming, config, mqtt_client, duration, audio)
+        _transcribe_and_publish(wyoming, config, mqtt_client, duration, audio, started)
     )
     finalizers.add(task)
     task.add_done_callback(finalizers.discard)
@@ -353,6 +361,7 @@ async def _transcribe_and_publish(
     mqtt_client,
     duration: float,
     audio: bytes,
+    started: float,
 ) -> None:
     """Collect the transcript for a finished transmission and publish it.
 
@@ -376,20 +385,21 @@ async def _transcribe_and_publish(
             return
 
         logger.info(f"Transcription [{duration:.1f}s]: {clean_text}")
-        await _publish_transcript(config, mqtt_client, clean_text, audio)
+        await _publish_transcript(config, mqtt_client, clean_text, audio, started)
     finally:
         await wyoming.disconnect()
 
 
 async def _publish_transcript(
-    config: dict, mqtt_client, clean_text: str, audio: bytes
+    config: dict, mqtt_client, clean_text: str, audio: bytes, started: float
 ) -> None:
     """Save the recording if enabled and publish the transcript to MQTT."""
     audio_file_name: str | None = None
+    # When the transmission began, not when its transcript came back.
+    stamp = local_time(started, config.get("timezone") or "UTC")
 
     if config.get("audio_recording", False) and audio:
         save_dir = audio_dir(config)
-        stamp = now_local(config.get("timezone", "UTC"))
         audio_file_path = await asyncio.to_thread(
             save_audio_recording,
             audio, str(config["frequency"]), stamp, save_dir,
@@ -406,7 +416,7 @@ async def _publish_transcript(
     message = {
         "text": clean_text,
         "frequency": str(config["frequency"]),
-        "timestamp": format_timestamp(config.get("timezone", "UTC")),
+        "timestamp": stamp.isoformat(),
     }
     if audio_file_name:
         message["audio_file"] = f"radio-audio/{audio_file_name}"

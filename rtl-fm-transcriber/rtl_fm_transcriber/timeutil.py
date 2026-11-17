@@ -18,11 +18,6 @@ def resolve_zone(tz_name: str = "UTC"):
         return UTC
 
 
-def now_local(tz_name: str = "UTC") -> datetime:
-    """Current time in the configured timezone."""
-    return datetime.now(resolve_zone(tz_name))
-
-
-def format_timestamp(tz_name: str = "UTC") -> str:
-    """ISO-8601 timestamp with offset, correct across DST transitions."""
-    return now_local(tz_name).isoformat()
+def local_time(epoch: float, tz_name: str = "UTC") -> datetime:
+    """An epoch time as a datetime in the configured timezone."""
+    return datetime.fromtimestamp(epoch, resolve_zone(tz_name))

@@ -34,10 +34,8 @@ async def _run(config, mqtt_client) -> None:
     loop = asyncio.get_running_loop()
     capture = asyncio.create_task(capture_loop(config, mqtt_client))
 
-    # Python runs as PID 1 here (init: false), where the default SIGTERM
-    # disposition is to ignore it. Without these handlers every add-on stop or
-    # update waited out Docker's kill timeout and then SIGKILLed, so nothing was
-    # cleaned up and the USB device was sometimes left in a bad state.
+    # Python runs as PID 1 here (init: false), where SIGTERM is ignored unless
+    # a handler is installed.
     for sig in (signal.SIGTERM, signal.SIGINT):
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, lambda s=sig: _request_stop(capture, s))
@@ -50,9 +48,8 @@ def main():
     logger.info("RTL-FM Transcriber starting (Wyoming Protocol)...")
     config = load_config()
 
-    # Single source of truth for the timezone: log timestamps track the option
-    # rather than run.sh exporting TZ separately.
-    os.environ["TZ"] = config.get("timezone", "UTC")
+    # Log timestamps follow the timezone option.
+    os.environ["TZ"] = config.get("timezone") or "UTC"
     time.tzset()
 
     try:
@@ -63,14 +60,19 @@ def main():
 
     # Check RTL-SDR
     try:
-        subprocess.run(
+        probe = subprocess.run(
             # Resolved via PATH, which is fixed inside the add-on image.
             ["rtl_test", "-t"],  # noqa: S607
             capture_output=True,
+            text=True,
             timeout=10,
             check=False,
         )
-        logger.info("RTL-SDR device check passed")
+        if probe.returncode == 0:
+            logger.info("RTL-SDR device check passed")
+        else:
+            detail = (probe.stderr.strip().splitlines() or ["no output"])[-1]
+            logger.error(f"RTL-SDR check failed (exit {probe.returncode}): {detail}")
     except Exception as e:  # noqa: BLE001 - probe only; rtl_fm reports real faults
         logger.error(f"RTL-SDR check failed: {e}")
         # Continue anyway, let rtl_fm fail if must

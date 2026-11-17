@@ -25,8 +25,7 @@ MANIFEST = yaml.safe_load((ADDON / "config.yaml").read_text())
         ("tcp://host:10300", ("host", 10300)),
         ("http://host:10300", ("host", 10300)),
         ("tcp://host", ("host", DEFAULT_WYOMING_PORT)),
-        # A scheme-less value used to parse with hostname None and silently fall
-        # back to localhost.
+        # Scheme-less forms
         ("10.0.0.1:10300", ("10.0.0.1", 10300)),
         ("myhost", ("myhost", DEFAULT_WYOMING_PORT)),
         ("  10.0.0.1:9000  ", ("10.0.0.1", 9000)),
@@ -95,6 +94,10 @@ def test_media_is_mapped_for_recordings():
         ({"frequency": 1.0}, "frequency"),
         ({"frequency": "155.1075"}, "frequency"),
         ({"gain": "medium"}, "gain"),
+        # rtl_fm treats 0 as "squelch off", and squelch is the only voice gate.
+        ({"squelch": 0}, "squelch"),
+        # sox filters at the 12 kHz capture rate and exits above its Nyquist limit.
+        ({"bandpass_high": 6000}, "bandpass_high"),
         ({"bandpass_low": 4000, "bandpass_high": 3000}, "bandpass_low"),
         ({"min_transmission_duration": 200.0}, "min_transmission_duration"),
     ],
@@ -105,7 +108,7 @@ def test_validate_rejects(bad, field):
         validate_config(config)
 
 
-@pytest.mark.parametrize("gain", ["auto", "AUTO", "28.0", "28", 28, 28.0])
+@pytest.mark.parametrize("gain", ["auto", "AUTO", " Auto ", "", None, "28.0", "28", 28, 28.0])
 def test_validate_accepts_gain_forms(gain):
     validate_config(load_config() | {"gain": gain})
 

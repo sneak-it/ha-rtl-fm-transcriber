@@ -4,7 +4,7 @@ configuration:
     description: Frequency to monitor, e.g. 155.1075.
   squelch:
     name: Squelch
-    description: 'Carrier detection threshold (0-200). This is the sensitivity knob: raise it to ignore
+    description: 'Carrier detection threshold (1-200). This is the sensitivity knob: raise it to ignore
       noise, lower it to catch weaker transmissions.'
   whisper_url:
     name: Wyoming server

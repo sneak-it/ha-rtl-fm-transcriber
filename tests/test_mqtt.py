@@ -71,6 +71,11 @@ def test_safe_publish_publishes_when_connected():
     assert client.published == [("t", "p", 1, True)]
 
 
+def test_safe_publish_reports_a_rejected_publish(monkeypatch):
+    monkeypatch.setattr(FakeResult, "rc", 4)  # MQTT_ERR_NO_CONN
+    assert safe_publish(FakeClient(), "t", "p") is False
+
+
 def test_safe_publish_swallows_broker_errors():
     client = FakeClient(raises=RuntimeError("broker gone"))
     assert safe_publish(client, "t", "p") is False

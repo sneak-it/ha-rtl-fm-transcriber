@@ -9,6 +9,11 @@ profile rtl_fm_transcriber flags=(attach_disconnected,mediate_deleted) {
   signal (send) set=(kill,term,int,hup,cont),
   network inet stream,
   network inet6 stream,
+  # DNS lookups for the broker and Wyoming hosts
+  network inet dgram,
+  network inet6 dgram,
+  # libusb opens a netlink socket for hotplug events and fails to start without it
+  network netlink raw,
 
   # S6 / add-on startup
   /run.sh r,
@@ -20,11 +25,6 @@ profile rtl_fm_transcriber flags=(attach_disconnected,mediate_deleted) {
   # Python and the add-on itself
   /usr/bin/python3* ix,
   /app/** r,
-
-  # rtl_fm and sox
-  /usr/bin/rtl_fm cx,
-  /usr/bin/rtl_test cx,
-  /usr/bin/sox cx,
 
   # Add-on options
   /data/** rw,

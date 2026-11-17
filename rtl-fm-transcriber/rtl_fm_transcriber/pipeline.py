@@ -9,6 +9,12 @@ logger = logging.getLogger(__name__)
 PROC_TERM_TIMEOUT = 5.0
 PIPE_TASK_TIMEOUT = 2.0
 
+# rtl_fm stops writing 10 blocks after the squelch closes; this many blocks
+# (about 130 ms each) keeps it writing zeros instead, so the stream never stalls.
+SQUELCH_MUTE_BLOCKS = "2000000000"
+# sox's default buffer holds back about 1.4 s of 12 kHz audio before releasing any.
+SOX_BUFFER_BYTES = "512"
+
 
 async def start_pipeline(config, frequency_hz, sample_rate, capture_rate):
     """Start the rtl_fm -> sox audio capture pipeline using asyncio subprocess.
@@ -18,14 +24,15 @@ async def start_pipeline(config, frequency_hz, sample_rate, capture_rate):
     """
     squelch_val = str(config.get("squelch", 50))
     ppm_val = config.get("ppm", 0)
+    gain = str(config.get("gain") or "auto").strip().lower()
 
     # Build rtl_fm command for narrowband FM (public safety radio)
     # -f: frequency in Hz
     # -M fm: narrowband FM demodulation
     # -s: sample rate (12000 for 12.5 kHz channels)
-    # -l: squelch threshold (0-200)
+    # -l: squelch threshold (1-200)
+    # -t: blocks of zeros to write after the squelch closes
     # -E dc: remove DC offset
-    # -E pad: output silence when squelched (prevents pipe starvation)
     # -p: PPM correction for dongle clock drift
     rtl_cmd = [
         "rtl_fm",
@@ -37,16 +44,16 @@ async def start_pipeline(config, frequency_hz, sample_rate, capture_rate):
         str(capture_rate),
         "-l",
         squelch_val,
+        "-t",
+        SQUELCH_MUTE_BLOCKS,
         "-E",
         "dc",  # Remove DC offset
-        "-E",
-        "pad",  # Output silence when squelched (prevents pipe starvation)
         "-p",
         str(ppm_val),  # PPM correction
     ]
 
-    if config.get("gain") and config["gain"] != "auto":
-        rtl_cmd.extend(["-g", str(config["gain"])])
+    if gain != "auto":
+        rtl_cmd.extend(["-g", gain])
 
     rtl_cmd.append("-")
 
@@ -55,6 +62,8 @@ async def start_pipeline(config, frequency_hz, sample_rate, capture_rate):
     # Output: sample_rate (16000), signed 16-bit, mono, raw
     sox_cmd = [
         "sox",
+        "--buffer",
+        SOX_BUFFER_BYTES,
         "-t",
         "raw",
         "-r",
@@ -172,9 +181,8 @@ async def _read_stderr_lines(proc, label):
 async def cleanup_pipeline(rtl_proc, sox_proc):
     """Terminate the pipeline processes and stop the pipe task.
 
-    Processes are terminated first. Waiting for the pipe task before that would
-    mean waiting for an EOF from rtl_fm that `-E pad` never produces, which cost
-    the full timeout on every restart and every add-on stop.
+    Processes are terminated first: the pipe task only ends on EOF from rtl_fm,
+    which a running rtl_fm never sends.
     """
     # Terminate rtl_fm first so the pipe task sees EOF, then sox.
     for name, proc in (("RTL_FM", rtl_proc), ("SOX", sox_proc)):

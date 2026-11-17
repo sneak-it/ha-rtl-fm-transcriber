@@ -26,6 +26,9 @@ END = "END"          # finalize the transmission
 # Cap on how long WARMUP may buffer before streaming starts regardless.
 WARMUP_TIMEOUT = 2.0
 
+# 16 kHz, 16-bit, mono
+BYTES_PER_SEC = 32000
+
 
 def decide(
     state,
@@ -94,7 +97,12 @@ class TransmissionState:
         # Audio buffered during warmup, then the rest of the transmission
         self.warmup_buffer: bytearray = bytearray()
         self.recording_buffer: bytearray = bytearray()
+        self.voiced_bytes: int = 0
 
+    @property
+    def audio_seconds(self) -> float:
+        """Seconds of voiced audio, which excludes the silence that ended it."""
+        return self.voiced_bytes / BYTES_PER_SEC
 
     @property
     def duration(self) -> float:
@@ -128,6 +136,7 @@ class TransmissionState:
         self.silence_start = None
         self.end_time = None
         self.warmup_buffer = bytearray(chunk)
+        self.voiced_bytes = len(chunk)
 
     def reset(self) -> None:
         """Reset to IDLE, ready for the next transmission."""
@@ -137,3 +146,4 @@ class TransmissionState:
         self.end_time = None
         self.warmup_buffer = bytearray()
         self.recording_buffer = bytearray()
+        self.voiced_bytes = 0

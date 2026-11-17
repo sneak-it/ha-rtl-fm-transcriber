@@ -9,6 +9,10 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_WYOMING_PORT = 10300
 
+# rtl_fm output rate, suited to 12.5 kHz narrowband FM channels. The sox
+# filters run at this rate, so its Nyquist limit bounds bandpass_high.
+CAPTURE_RATE = 12000
+
 # rtl-sdr tuning range, in MHz (R820T/R828D front ends)
 FREQ_MIN_MHZ = 24.0
 FREQ_MAX_MHZ = 1766.0
@@ -65,8 +69,7 @@ def load_config():
 def parse_wyoming_url(url: str) -> tuple[str, int]:
     """Split a Wyoming server URL into (host, port).
 
-    Accepts a bare "host:port" as well as a full URL. A scheme-less value used
-    to parse with hostname None and silently fall back to localhost.
+    Accepts a bare "host:port" as well as a full URL.
 
     Raises:
         ConfigError: if no host can be determined.
@@ -102,7 +105,13 @@ def validate_config(config: dict) -> None:
             f"{FREQ_MIN_MHZ}-{FREQ_MAX_MHZ} MHz"
         )
 
-    gain = config.get("gain", "auto")
+    if config.get("squelch", 50) < 1:
+        raise ConfigError(
+            "squelch must be at least 1: 0 turns the rtl_fm squelch off, which "
+            "would transcribe static continuously"
+        )
+
+    gain = config.get("gain") or "auto"
     if str(gain).strip().lower() != "auto":
         try:
             float(gain)
@@ -116,6 +125,12 @@ def validate_config(config: dict) -> None:
     if config.get("bandpass_filter", True) and low >= high:
         raise ConfigError(
             f"bandpass_low ({low}) must be below bandpass_high ({high})"
+        )
+
+    if config.get("bandpass_filter", True) and high >= CAPTURE_RATE / 2:
+        raise ConfigError(
+            f"bandpass_high ({high}) must be below {CAPTURE_RATE // 2} Hz, half "
+            f"the {CAPTURE_RATE} Hz capture rate; sox refuses to start otherwise"
         )
 
     min_dur = config.get("min_transmission_duration", 0.3)

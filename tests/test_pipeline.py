@@ -4,7 +4,11 @@ import asyncio
 
 import pytest
 
-from rtl_fm_transcriber.pipeline import cleanup_pipeline, read_stderr_pipeline
+from rtl_fm_transcriber.pipeline import (
+    cleanup_pipeline,
+    read_stderr_pipeline,
+    start_pipeline,
+)
 
 
 class FakeStream:
@@ -51,6 +55,60 @@ class FakeProc:
         return self.returncode
 
 
+class FakePipe:
+    """stdout/stdin stand-in: reads EOF, accepts a close."""
+
+    async def read(self, _n):
+        return b""
+
+    def close(self):
+        pass
+
+    async def wait_closed(self):
+        pass
+
+
+async def _spawned_commands(monkeypatch, **options):
+    commands = []
+
+    async def fake_exec(*cmd, **_kwargs):
+        commands.append(cmd)
+        proc = FakeProc()
+        proc.stdout = proc.stdin = FakePipe()
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    _, sox = await start_pipeline(options, 155107500, 16000, 12000)
+    await sox._pipe_task
+    return commands
+
+
+async def test_rtl_fm_keeps_writing_while_squelched(monkeypatch):
+    """The segmenter needs a continuous stream, zeros included.
+
+    rtl_fm 2.0.2 has no `-E pad` (it ignores unknown -E values) and by default
+    stops writing 10 blocks after the squelch closes; `-t` keeps it writing.
+    """
+    rtl, _ = await _spawned_commands(monkeypatch)
+    assert "pad" not in rtl
+    assert int(rtl[rtl.index("-t") + 1]) > 1_000_000
+
+
+async def test_sox_does_not_hold_audio_back(monkeypatch):
+    """sox's default buffer releases audio in 1.4s bursts, skewing every timer."""
+    _, sox = await _spawned_commands(monkeypatch)
+    assert int(sox[sox.index("--buffer") + 1]) <= 1024
+
+
+@pytest.mark.parametrize(
+    ("gain", "expected"),
+    [("auto", None), (" Auto ", None), ("", None), (None, None), ("28.0", "28.0"), (40, "40")],
+)
+async def test_gain_is_passed_only_when_manual(monkeypatch, gain, expected):
+    rtl, _ = await _spawned_commands(monkeypatch, gain=gain)
+    assert (rtl[rtl.index("-g") + 1] if "-g" in rtl else None) == expected
+
+
 async def test_cleanup_terminates_both_processes():
     rtl, sox = FakeProc(), FakeProc()
     await cleanup_pipeline(rtl, sox)
@@ -58,7 +116,7 @@ async def test_cleanup_terminates_both_processes():
 
 
 async def test_cleanup_does_not_wait_on_a_pipe_task_that_never_ends():
-    """Teardown must not wait for an EOF that -E pad never produces.
+    """Teardown must not wait for an EOF that a running rtl_fm never sends.
 
     Regression: cleanup waited up to 10s for the pipe task before terminating
     rtl_fm, but the pipe task only exits on rtl_fm EOF, so every restart and

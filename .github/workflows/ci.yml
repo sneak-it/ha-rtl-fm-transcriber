@@ -23,11 +23,8 @@ jobs:
       - name: Tests
         run: pytest -q
 
-  # Builds the image the same way the Supervisor does: plain docker build with
-  # BUILD_FROM taken from build.json. The home-assistant/builder action is
-  # deprecated and slated for removal, and its replacement is aimed at publishing
-  # images to a registry, which this add-on does not do (no image key in
-  # config.yaml means every install builds locally).
+  # Checks that the image builds for each architecture, with BUILD_FROM taken
+  # from build.json. Publishing happens in release.yml.
   build:
     name: Build ${{ matrix.arch }}
     runs-on: ubuntu-latest

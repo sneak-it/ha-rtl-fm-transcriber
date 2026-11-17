@@ -15,12 +15,8 @@ SUBDIR = "radio-audio"
 # Default. /media is served only through Home Assistant's authenticated
 # endpoints and is what the media-source:// URI in the MQTT payload resolves to.
 MEDIA_DIR = f"/media/{SUBDIR}"
-# Opt-in. This is Home Assistant's own config directory, mounted at
-# /homeassistant by the homeassistant_config map (the legacy config map, which
-# put it at /config, was deprecated in Supervisor 2023.11). Its www folder is
-# served at /local/ with NO authentication, so anyone who can reach Home
-# Assistant can enumerate and download recordings. Only useful because it allows
-# inline <audio> playback in a dashboard card.
+# Opt-in, for inline <audio> playback in a dashboard card. Home Assistant serves
+# this folder at /local/ with NO authentication.
 WWW_DIR = f"/homeassistant/www/{SUBDIR}"
 
 
@@ -37,13 +33,7 @@ def audio_url(config, filename: str) -> str:
 
 
 def recording_filename(stamp: datetime, frequency: str, counter: int = 0) -> str:
-    """Build a sortable WAV filename: YYYYMMDD-HHMMSS-<freq>.wav.
-
-    Formatted straight from the datetime. Scrubbing an ISO string instead used to
-    strip the minus sign from a negative UTC offset and fuse the offset digits
-    into the time, so every US-timezone user got names like
-    20260727T1215000400-155_1075.wav.
-    """
+    """Build a sortable WAV filename: YYYYMMDD-HHMMSS-<freq>.wav."""
     freq_safe = str(frequency).replace(".", "_")
     suffix = f"_{counter}" if counter else ""
     return f"{stamp.strftime('%Y%m%d-%H%M%S')}-{freq_safe}{suffix}.wav"

@@ -31,10 +31,8 @@ def client_id(config) -> str:
 def create_mqtt_client(config):
     """Connect to the broker, retrying with backoff, and return the client.
 
-    Connectivity is tracked through the on_connect/on_disconnect callbacks
-    rather than polled, and paho's own reconnect thread does the reconnecting;
-    calling reconnect() by hand raced it and tore down connections that had just
-    succeeded.
+    Connectivity is tracked through the on_connect/on_disconnect callbacks, and
+    paho's own network thread does the reconnecting.
     """
     logger.info("[MQTT] Initializing MQTT client...")
     client = mqtt.Client(
@@ -118,11 +116,7 @@ def create_mqtt_client(config):
 
 
 def is_mqtt_connected(client) -> bool:
-    """Whether the broker connection is currently up.
-
-    No manual reconnect here: paho's network thread owns that, and polling
-    is_connected() straight after a reconnect() call raced it.
-    """
+    """Whether the broker connection is currently up."""
     return bool(client.is_connected())
 
 
@@ -137,6 +131,9 @@ def safe_publish(client, topic, payload, qos=0, retain=False, label="message") -
         logger.error(
             f"[MQTT] {label} publish failed: type={type(e).__name__}, error={e}"
         )
+        return False
+    if result.rc != mqtt.MQTT_ERR_SUCCESS:
+        logger.error(f"[MQTT] {label} publish rejected by client: rc={result.rc}")
         return False
     logger.info(
         f"[MQTT] Published {label} to topic='{topic}' "

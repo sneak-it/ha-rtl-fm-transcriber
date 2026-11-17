@@ -7,10 +7,9 @@ before updating.
 
 ### Breaking
 
-- **Voice detection is now squelch-gated.** `rtl_fm` already ran with
-  `-l <squelch> -E pad`, which emits zero-padded samples while the squelch is
-  closed, but detection treated "quieter than the baseline" as voice, making
-  digital silence the most voice-like input possible. Depending on what the air
+- **Voice detection is now squelch-gated.** `rtl_fm` writes zeros while the
+  squelch is closed, but detection treated "quieter than the baseline" as
+  voice, making digital silence the most voice-like input possible. Depending on what the air
   sounded like at startup, that either streamed endless silence to Whisper or
   never detected anything at all. A chunk now counts as voice when rtl_fm is
   passing real audio, and **`squelch` is the sensitivity knob**: raise it to
@@ -21,6 +20,9 @@ before updating.
   attributes and only one was ever read; `silence_timeout` is now the single
   silence setting.
 - **Removed options** `chunk_duration` and `debug_audio`, which nothing read.
+- **`squelch` must be at least 1 and `bandpass_high` below 6000.** A squelch of
+  0 turns the `rtl_fm` squelch off, leaving nothing to detect a transmission
+  with, and `sox` exits on a filter frequency above half the 12 kHz capture rate.
 - **Recordings moved to `/media/radio-audio`.** `/config/www` is served at
   `/local/` with no authentication, so recorded public-safety traffic was
   downloadable by anyone who could reach Home Assistant. `/media` is served only
@@ -69,6 +71,20 @@ before updating.
   carrier that outlives it splits into consecutive transmissions instead of
   being truncated.
 
+- `-E pad` was never an option in the `rtl_fm` the add-on ships (2.0.2 ignores
+  unknown `-E` values), so `rtl_fm` stopped writing about 1.3s after each
+  transmission. When that happened before a full chunk of silence had arrived,
+  the transmission stayed open until the next one and was merged into it. It
+  now runs with `-t`, which keeps it writing zeros, and a stream that stalls
+  mid-transmission ends the transmission.
+- `sox` held audio back and released it in bursts of about 1.4s, so every timer
+  was that coarse and every transcript that late. Audio now arrives every 130ms.
+- `min_transmission_duration` never discarded anything: it was compared against
+  a duration that included the silence timeout. It is now compared against
+  voiced audio, so squelch flickers no longer reach the speech-to-text server.
+- The MQTT `timestamp` and the recording filename were the time the transcript
+  came back; they are now the time the transmission began.
+
 ### Fixed, connections and shutdown
 
 - TCP connections to the Wyoming server leaked on every transmission and every
@@ -112,6 +128,10 @@ before updating.
   transition; they now use `zoneinfo`.
 - Frequency tuning truncated instead of rounding, tuning some frequencies 1 Hz
   low.
+- The hallucination filter missed punctuated forms such as "You.".
+- A gain of "Auto" with different capitalisation or spacing passed validation
+  but reached `rtl_fm` as a manual gain of 0 dB.
+- The startup dongle check logged "passed" whatever `rtl_test` reported.
 
 ### Added
 
@@ -130,7 +150,7 @@ before updating.
 
 - The single 1870-line `transcriber.py` is now the `rtl_fm_transcriber` package,
   twelve modules with one concern each. `transcriber.py` remains as an
-  entry-point shim. Segmentation is a pure function covered by 119 tests.
+  entry-point shim. Segmentation is a pure function covered by 144 tests.
 - Roughly 300 lines of never-called code removed.
 - `ppm` accepts negative values, which cheap dongles commonly need.
 - The broker password no longer renders in clear text in the configuration UI.

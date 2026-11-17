@@ -127,6 +127,9 @@ class TestHallucinationFilter:
             "transcribed by someone",
             "you",
             "You",
+            "You.",
+            " you!",
+            "...",
             "a",
             "",
         ],
@@ -144,6 +147,7 @@ class TestHallucinationFilter:
             "Unit 4 responding",
             "Copy that, en route",
             "you copy?",
+            "10-4.",
         ],
     )
     def test_keeps_legitimate_traffic(self, text):
