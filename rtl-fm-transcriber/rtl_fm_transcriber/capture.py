@@ -321,6 +321,11 @@ async def _finish(
     transmission.end_time = time.time()
     if transmission.duration >= transmission.max_duration:
         reason = f"max duration ({transmission.max_duration}s)"
+        logger.warning(
+            f"[VAD] Squelch stayed open for {transmission.max_duration}s. If this "
+            f"repeats, it is opening on noise: raise squelch (now "
+            f"{config.get('squelch', 50)}) or lower gain."
+        )
     else:
         reason = f"silence timeout ({transmission.silence_timeout}s)"
     # Voiced audio, not wall-clock: the latter includes the silence timeout.

@@ -106,8 +106,11 @@ max_transmission_duration: 120.0
 ```
 
 With these settings:
-- Squelch 50 gates out background noise; tune with `rtl_fm -l` if transmissions
-  are missed (too high) or noise is transcribed (too low)
+- Squelch 50 is a starting point. The level that gates out noise depends on
+  gain and antenna: if every recording runs to `max_transmission_duration` with
+  static around the speech, the squelch is opening on noise, so raise `squelch`
+  (or lower `gain`) until idle air logs no "Transmission started". If
+  transmissions are missed, it is too high
 - 150ms warmup buffer is captured before the Wyoming session opens, so the start
   of the transmission is not lost
 - 2.0s of silence ends a transmission
